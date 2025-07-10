@@ -18,3 +18,5 @@ pubspec.lock
 Podfile.lock
 
 **/.cxx/
+
+.DS_Store
