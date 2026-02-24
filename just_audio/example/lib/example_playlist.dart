@@ -34,63 +34,100 @@ class MyApp extends StatefulWidget {
 
 class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   late AudioPlayer _player;
-  double _preloadBufferSeconds = 30.0;
-  double _preferredForwardBufferSeconds = 30.0;
-  DateTime? _playPressedTime;
-  final Map<int, int> _itemArrivalMs = {};
-  final Map<int, Duration> _itemBuffered = {};
-  final Map<int, Duration> _itemDuration = {};
+  double _preloadBufferSeconds = 20.0;
+  double _preferredForwardBufferSeconds = 20.0;
+  bool _autoPlay = false;
+  List<Duration> _bufferedPerIndex = const [];
+  List<Duration?> _durationPerIndex = const [];
+  Map<int, int> _playDelayPerIndex = {};
+  DateTime? _indexChangeTime;
+  int? _pendingDelayIndex;
+  Duration? _pendingBaselinePosition;
 
-  static final _playlist = [
-    AudioSource.uri(
-      Uri.parse(
-          "https://storage.googleapis.com/ai_dj_audio/messages/users/D041uzAuqmeIRY5CvvE6nQUK3Vv2/msg_user_hey__7367922848854d57bc488cbd048ae324.mp3"),
-      tag: AudioMetadata(
-        album: "AI DJ - Hey",
-        title: "AI DJ - Hey",
-        artwork: "",
-      ),
-    ),
-    SilenceStreamAudioSource(
-        duration: const Duration(milliseconds: 200),
-        tag:
-            AudioMetadata(album: "Silence 1", title: "Silence 1", artwork: "")),
-    AudioSource.uri(
-      Uri.parse(
-          "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/00__e0b0794e75a6494a89cc548d976f6682.mp3"),
-      tag: AudioMetadata(
-        album: "AI DJ - Intro",
-        title: "AI DJ - Intro",
-        artwork: "",
-      ),
-    ),
-    SilenceStreamAudioSource(
-        duration: const Duration(milliseconds: 1000),
-        tag:
-            AudioMetadata(album: "Silence 2", title: "Silence 2", artwork: "")),
-    AudioSource.uri(
-      Uri.parse(
-          "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/01__11dabf89a28b435288bafe86080d1a95.mp3"),
-      tag: AudioMetadata(
-        album: "AI DJ - Highlight 1 - Intro",
-        title: "AI DJ - Highlight 1 - Intro",
-        artwork: "",
-      ),
-    ),
-    SilenceStreamAudioSource(
-        duration: const Duration(milliseconds: 1000),
-        tag:
-            AudioMetadata(album: "Silence 2", title: "Silence 2", artwork: "")),
-    AudioSource.uri(
-      Uri.parse(
-          "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/02__56812fee7031416c906dd0f6623e0459.mp3"),
-      tag: AudioMetadata(
-        album: "AI DJ - Highlight 2 - Intro",
-        title: "AI DJ - Highlight 2 - Intro",
-        artwork: "",
-      ),
-    ),
-  ];
+  List<AudioSource> _buildPlaylist() => [
+        AudioSource.uri(
+          Uri.parse(
+              "https://storage.googleapis.com/ai_dj_audio/messages/users/D041uzAuqmeIRY5CvvE6nQUK3Vv2/msg_user_hey__7367922848854d57bc488cbd048ae324.mp3"),
+          tag: AudioMetadata(
+            album: "AI DJ - Hey",
+            title: "AI DJ - Hey",
+            artwork: "",
+          ),
+        ),
+        SilenceStreamAudioSource(
+            duration: const Duration(milliseconds: 200),
+            tag: AudioMetadata(
+                album: "Silence 1", title: "Silence 1", artwork: "")),
+        AudioSource.uri(
+          Uri.parse(
+              "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/00__e0b0794e75a6494a89cc548d976f6682.mp3"),
+          tag: AudioMetadata(
+            album: "AI DJ - Intro",
+            title: "AI DJ - Intro",
+            artwork: "",
+          ),
+        ),
+        SilenceStreamAudioSource(
+            duration: const Duration(milliseconds: 1000),
+            tag: AudioMetadata(
+                album: "Silence 2", title: "Silence 2", artwork: "")),
+        AudioSource.uri(
+          Uri.parse(
+              "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/01__11dabf89a28b435288bafe86080d1a95.mp3"),
+          tag: AudioMetadata(
+            album: "AI DJ - Highlight 1 - Intro",
+            title: "AI DJ - Highlight 1 - Intro",
+            artwork: "",
+          ),
+        ),
+        SilenceStreamAudioSource(
+            duration: const Duration(milliseconds: 500),
+            tag: AudioMetadata(
+                album: "Silence 2 bis", title: "Silence 2 bis", artwork: "")),
+        ClippingAudioSource(
+          child: AudioSource.uri(
+            Uri.parse(
+                "https://dcs-cached.megaphone.fm/SIXMSB5590854818.mp3?key=75fd4d8562fd64283912817692dfa311&request_event_id=41f069a0-3cf2-4de2-99ca-87ff24b6d2f0&session_id=6618ee95-1671-4cd7-af3b-2143a5d0aa08&timetoken=1771934611_D8140FB4E04D0C3FB507D956E0C32705"),
+          ),
+          start: const Duration(seconds: 120),
+          end: const Duration(seconds: 200),
+          tag: AudioMetadata(
+            album: "AI DJ - Highlight 1 - Episode",
+            title: "AI DJ - Highlight 1 - Episode",
+            artwork: "",
+          ),
+        ),
+        SilenceStreamAudioSource(
+            duration: const Duration(milliseconds: 1000),
+            tag: AudioMetadata(
+                album: "Silence 3", title: "Silence 3", artwork: "")),
+        AudioSource.uri(
+          Uri.parse(
+              "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/02__56812fee7031416c906dd0f6623e0459.mp3"),
+          tag: AudioMetadata(
+            album: "AI DJ - Highlight 2 - Intro",
+            title: "AI DJ - Highlight 2 - Intro",
+            artwork: "",
+          ),
+        ),
+        SilenceStreamAudioSource(
+            duration: const Duration(milliseconds: 500),
+            tag: AudioMetadata(
+                album: "Silence 3 bis", title: "Silence 3 bis", artwork: "")),
+        ClippingAudioSource(
+          child: AudioSource.uri(
+            Uri.parse(
+                "https://dcs-cached.megaphone.fm/SIXMSB5590854818.mp3?key=75fd4d8562fd64283912817692dfa311&request_event_id=41f069a0-3cf2-4de2-99ca-87ff24b6d2f0&session_id=6618ee95-1671-4cd7-af3b-2143a5d0aa08&timetoken=1771934611_D8140FB4E04D0C3FB507D956E0C32705"),
+          ),
+          start: const Duration(seconds: 640),
+          end: const Duration(seconds: 800),
+          tag: AudioMetadata(
+            album: "AI DJ - Highlight 2 - Episode",
+            title: "AI DJ - Highlight 2 - Episode",
+            artwork: "",
+          ),
+        ),
+      ];
   int _addedCount = 0;
   final _scaffoldMessengerKey = GlobalKey<ScaffoldMessengerState>();
 
@@ -130,67 +167,99 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     await _player.dispose();
     setState(() {
       _player = _createPlayer();
-      _playPressedTime = null;
-      _itemArrivalMs.clear();
-      _itemBuffered.clear();
-      _itemDuration.clear();
+      _bufferedPerIndex = const [];
+      _durationPerIndex = const [];
+      _playDelayPerIndex = {};
     });
+    _pendingDelayIndex = null;
+    _indexChangeTime = null;
+    _pendingBaselinePosition = null;
     await _init();
   }
 
   Future<void> _init() async {
     final session = await AudioSession.instance;
     await session.configure(const AudioSessionConfiguration.speech());
-    // Listen to errors during playback.
     _player.errorStream.listen((e) {
       print('A stream error occurred: $e');
     });
-    try {
-      await _player.setAudioSources(_playlist);
-    } on PlayerException catch (e) {
-      // Catch load errors: 404, invalid url...
-      print("Error loading playlist: $e");
-    }
-    // Record ms from Play press to each item becoming current.
-    _player.currentIndexStream.listen((idx) {
-      if (idx == null) return;
-      final start = _playPressedTime;
-      if (start == null) return;
-      if (!_itemArrivalMs.containsKey(idx)) {
+
+    int? lastSeenIndex;
+
+    _player.currentIndexStream.listen((index) {
+      if (index != null && lastSeenIndex != null && index != lastSeenIndex) {
+        _indexChangeTime = DateTime.now();
+        _pendingDelayIndex = index;
+        _pendingBaselinePosition = null;
+      }
+      lastSeenIndex = index;
+    });
+
+    _player.positionStream.listen((position) {
+      final pending = _pendingDelayIndex;
+      final changeTime = _indexChangeTime;
+      if (pending == null ||
+          changeTime == null ||
+          _player.currentIndex != pending) return;
+
+      if (_pendingBaselinePosition == null) {
+        _pendingBaselinePosition = position;
+        return;
+      }
+
+      if (position > _pendingBaselinePosition!) {
+        final delay = DateTime.now().difference(changeTime).inMilliseconds;
         setState(() {
-          _itemArrivalMs[idx] = DateTime.now().difference(start).inMilliseconds;
+          _playDelayPerIndex[pending] = delay;
         });
+        _pendingDelayIndex = null;
+        _indexChangeTime = null;
+        _pendingBaselinePosition = null;
       }
     });
 
-    // Show a snackbar whenever reaching the end of an item in the playlist.
-    _player.positionDiscontinuityStream.listen((discontinuity) {
-      if (discontinuity.reason == PositionDiscontinuityReason.autoAdvance) {
-        _showItemFinished(discontinuity.previousEvent.currentIndex);
+    try {
+      if (_autoPlay) {
+        _indexChangeTime = DateTime.now();
+        _pendingDelayIndex = 0;
+        _pendingBaselinePosition = null;
       }
+      await _player.setAudioSources(_buildPlaylist());
+      if (_autoPlay) {
+        _player.play();
+      }
+    } on PlayerException catch (e) {
+      print("Error loading playlist: $e");
+    }
+
+    _player.bufferedPositionPerIndexStream.listen((list) {
+      setState(() => _bufferedPerIndex = list);
     });
-    _player.processingStateStream.listen((state) {
-      if (state == ProcessingState.completed) {
-        _showItemFinished(_player.currentIndex);
-      }
+
+    _player.loadedDurationPerIndexStream.listen((list) {
+      setState(() => _durationPerIndex = list);
     });
   }
 
   void _onPlayPressed() {
-    setState(() {
-      _playPressedTime = DateTime.now();
-      _itemArrivalMs.clear();
-    });
+    final idx = _player.currentIndex;
+    if (idx != null) {
+      _indexChangeTime = DateTime.now();
+      _pendingDelayIndex = idx;
+      _pendingBaselinePosition = null;
+    }
     _player.play();
   }
 
   void _resetTiming() {
     setState(() {
-      _playPressedTime = null;
-      _itemArrivalMs.clear();
-      _itemBuffered.clear();
-      _itemDuration.clear();
+      _bufferedPerIndex = const [];
+      _durationPerIndex = const [];
+      _playDelayPerIndex = {};
     });
+    _pendingDelayIndex = null;
+    _indexChangeTime = null;
+    _pendingBaselinePosition = null;
   }
 
   String _fmtDuration(Duration d) {
@@ -201,13 +270,21 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   }
 
   Widget? _buildItemSubtitle(int i) {
-    final buf = _itemBuffered[i];
-    final dur = _itemDuration[i];
-    final arrivalMs = _itemArrivalMs[i];
+    final buf = i < _bufferedPerIndex.length ? _bufferedPerIndex[i] : null;
+    final dur = i < _durationPerIndex.length ? _durationPerIndex[i] : null;
 
-    if (buf == null && arrivalMs == null) return null;
+    final delay = _playDelayPerIndex[i];
 
-    final double? fraction = (buf != null && dur != null && dur > Duration.zero)
+    if (buf == null && delay == null) return null;
+
+    if (buf == null) {
+      return Text(
+        'play delay: ${delay}ms',
+        style: TextStyle(fontSize: 11, color: Colors.orange.shade700),
+      );
+    }
+
+    final double? fraction = (dur != null && dur > Duration.zero)
         ? (buf.inMicroseconds / dur.inMicroseconds).clamp(0.0, 1.0)
         : null;
 
@@ -229,39 +306,23 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
           ),
         Row(
           children: [
-            if (buf != null)
+            Text(
+              dur != null
+                  ? '${_fmtDuration(buf)} / ${_fmtDuration(dur)} buffered'
+                  : '${_fmtDuration(buf)} buffered',
+              style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+            ),
+            if (delay != null) ...[
+              const SizedBox(width: 8),
               Text(
-                dur != null
-                    ? '${_fmtDuration(buf)} / ${_fmtDuration(dur)} buffered'
-                    : '${_fmtDuration(buf)} buffered',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                'play delay: ${delay}ms',
+                style: TextStyle(fontSize: 11, color: Colors.orange.shade700),
               ),
-            if (buf != null && arrivalMs != null)
-              Text(
-                '  ·  ',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade400),
-              ),
-            if (arrivalMs != null)
-              Text(
-                '+${arrivalMs}ms',
-                style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
-              ),
+            ],
           ],
         ),
       ],
     );
-  }
-
-  void _showItemFinished(int? index) {
-    if (index == null) return;
-    final sequence = _player.sequence;
-    if (index >= sequence.length) return;
-    final source = sequence[index];
-    final metadata = source.tag as AudioMetadata;
-    // _scaffoldMessengerKey.currentState?.showSnackBar(SnackBar(
-    //   content: Text('Finished playing ${metadata.title}'),
-    //   duration: const Duration(seconds: 1),
-    // ));
   }
 
   @override
@@ -296,6 +357,8 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       scaffoldMessengerKey: _scaffoldMessengerKey,
       home: Scaffold(
         appBar: AppBar(
+          automaticallyImplyLeading: false,
+          centerTitle: false,
           title: const Text('Playlist Example'),
           actions: [
             TextButton.icon(
@@ -310,34 +373,17 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             crossAxisAlignment: CrossAxisAlignment.center,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Expanded(
-                child: StreamBuilder<SequenceState?>(
-                  stream: _player.sequenceStateStream,
-                  builder: (context, snapshot) {
-                    final state = snapshot.data;
-                    if (state?.sequence.isEmpty ?? true) {
-                      return const SizedBox();
-                    }
-                    final metadata = state!.currentSource!.tag as AudioMetadata;
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.all(8.0),
-                            child:
-                                Center(child: Image.network(metadata.artwork)),
-                          ),
-                        ),
-                        Text(metadata.album,
-                            style: Theme.of(context).textTheme.titleLarge),
-                        Text(metadata.title),
-                      ],
-                    );
-                  },
-                ),
-              ),
               ControlButtons(_player, onPlay: _onPlayPressed),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('Auto-play'),
+                  Switch(
+                    value: _autoPlay,
+                    onChanged: (v) => setState(() => _autoPlay = v),
+                  ),
+                ],
+              ),
               StreamBuilder<PositionData>(
                 stream: _positionDataStream,
                 builder: (context, snapshot) {
@@ -439,27 +485,12 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                   ),
                 ],
               ),
-              SizedBox(
-                height: 240.0,
-                child: StreamBuilder<(SequenceState?, PlaybackEvent)>(
-                  stream: Rx.combineLatest2(
-                    _player.sequenceStateStream,
-                    _player.playbackEventStream,
-                    (a, b) => (a, b),
-                  ),
+              Expanded(
+                child: StreamBuilder<SequenceState?>(
+                  stream: _player.sequenceStateStream,
                   builder: (context, snapshot) {
-                    final seqState = snapshot.data?.$1;
-                    final event = snapshot.data?.$2;
+                    final seqState = snapshot.data;
                     final sequence = seqState?.sequence ?? [];
-
-                    // Cache buffer state for the currently playing item.
-                    final currentIdx = event?.currentIndex;
-                    if (currentIdx != null && event != null) {
-                      _itemBuffered[currentIdx] = event.bufferedPosition;
-                      if (event.duration != null) {
-                        _itemDuration[currentIdx] = event.duration!;
-                      }
-                    }
 
                     return ReorderableListView(
                       onReorder: (int oldIndex, int newIndex) {
@@ -665,7 +696,7 @@ class _BufferSlider extends StatelessWidget {
             child: Slider(
               value: value,
               min: 0,
-              max: 600,
+              max: 300,
               divisions: 60,
               onChanged: onChanged,
             ),
@@ -779,8 +810,6 @@ class SilenceStreamAudioSource extends StreamAudioSource {
 
     start ??= 0;
     end ??= bytes.length;
-
-    print('>> SilenceStreamAudioSource request: $start, $end');
 
     return StreamAudioResponse(
       sourceLength: bytes.length,

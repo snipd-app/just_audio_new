@@ -295,6 +295,8 @@ class PlaybackEventMessage {
   final int? androidAudioSessionId;
   final int? errorCode;
   final String? errorMessage;
+  final List<Duration> bufferedPositionPerIndex;
+  final List<Duration?> loadedDurationPerIndex;
 
   PlaybackEventMessage({
     required this.processingState,
@@ -307,6 +309,8 @@ class PlaybackEventMessage {
     required this.androidAudioSessionId,
     this.errorCode,
     this.errorMessage,
+    this.bufferedPositionPerIndex = const [],
+    this.loadedDurationPerIndex = const [],
   });
 
   static PlaybackEventMessage fromMap(Map<dynamic, dynamic> map) =>
@@ -329,6 +333,18 @@ class PlaybackEventMessage {
         androidAudioSessionId: map['androidAudioSessionId'] as int?,
         errorCode: map['errorCode'] as int?,
         errorMessage: map['errorMessage'] as String?,
+        bufferedPositionPerIndex:
+            (map['bufferedPositionPerIndex'] as List<dynamic>?)
+                    ?.map((e) => Duration(microseconds: (e as num).toInt()))
+                    .toList() ??
+                const [],
+        loadedDurationPerIndex:
+            (map['loadedDurationPerIndex'] as List<dynamic>?)
+                    ?.map((e) => e == null || (e as num).toInt() < 0
+                        ? null
+                        : Duration(microseconds: e.toInt()))
+                    .toList() ??
+                const [],
       );
 }
 

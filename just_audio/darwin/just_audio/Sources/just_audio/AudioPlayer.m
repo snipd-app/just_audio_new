@@ -58,6 +58,8 @@ static const BOOL DEBUG_LOG = NO;
     NSDictionary<NSString *, NSObject *> *_icyMetadata;
     NSNumber *_errorCode;
     NSString *_errorMessage;
+    NSArray<NSNumber *> *_bufferedPositionsPerItem;
+    NSMutableArray<NSNumber *> *_loadedDurationsPerItem;
 }
 
 - (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation {
@@ -222,8 +224,13 @@ static const BOOL DEBUG_LOG = NO;
         [catSource setShuffleOrder:shuffleOrder];
     }
     // Index the new audio sources.
+    NSArray<NSNumber *> *oldDurations = _loadedDurationsPerItem;
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
+    _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    for (int i = 0; i < (int)_indexedAudioSources.count; i++) {
+        [_loadedDurationsPerItem addObject:(i < (int)oldDurations.count ? oldDurations[i] : @(-1LL))];
+    }
     for (int i = 0; i < [_indexedAudioSources count]; i++) {
         IndexedAudioSource *audioSource = _indexedAudioSources[i];
         if (!audioSource.isAttached) {
@@ -261,8 +268,10 @@ static const BOOL DEBUG_LOG = NO;
     }
     // Re-index the remaining audio sources.
     NSArray<IndexedAudioSource *> *oldIndexedAudioSources = _indexedAudioSources;
+    NSArray<NSNumber *> *oldDurations = _loadedDurationsPerItem;
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
+    _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
     for (int i = 0, j = 0; i < _indexedAudioSources.count; i++, j++) {
         IndexedAudioSource *audioSource = _indexedAudioSources[i];
         while (audioSource != oldIndexedAudioSources[j]) {
@@ -277,6 +286,7 @@ static const BOOL DEBUG_LOG = NO;
             }
             j++;
         }
+        [_loadedDurationsPerItem addObject:(j < (int)oldDurations.count ? oldDurations[j] : @(-1LL))];
     }
     [self updateOrder];
     if (_index >= _indexedAudioSources.count) _index = (int)_indexedAudioSources.count - 1;
@@ -299,6 +309,15 @@ static const BOOL DEBUG_LOG = NO;
     // Re-index the audio sources.
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
+    _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    for (int i = 0; i < (int)_indexedAudioSources.count; i++) {
+        CMTime dur = _indexedAudioSources[i].duration;
+        if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur)) {
+            [_loadedDurationsPerItem addObject:@((int64_t)(CMTimeGetSeconds(dur) * 1e6))];
+        } else {
+            [_loadedDurationsPerItem addObject:@(-1LL)];
+        }
+    }
     [self updateOrder];
     [self enqueueFrom:[self indexForItem:(IndexedPlayerItem *)_player.currentItem]];
     [self broadcastPlaybackEvent];
@@ -346,6 +365,49 @@ static const BOOL DEBUG_LOG = NO;
     }
 }
 
+- (NSArray<NSNumber *> *)computeBufferedPositionsPerItem {
+    NSMutableArray<NSNumber *> *arr = [[NSMutableArray alloc] init];
+    for (int i = 0; i < (int)_indexedAudioSources.count; i++) {
+        int ms = (int)(1000 * CMTimeGetSeconds(_indexedAudioSources[i].bufferedPosition));
+        if (ms < 0) ms = 0;
+        [arr addObject:@((long long)1000 * ms)]; // microseconds
+    }
+    return [arr copy];
+}
+
+- (NSArray<NSNumber *> *)computeLoadedDurationsPerItem {
+    NSMutableArray<NSNumber *> *arr = [[NSMutableArray alloc] init];
+    for (int i = 0; i < (int)_indexedAudioSources.count; i++) {
+        if (i == _index) {
+            long long durUs = [self getDurationMicroseconds];
+            [arr addObject:@(durUs)];
+        } else if (_loadedDurationsPerItem && i < (int)_loadedDurationsPerItem.count) {
+            [arr addObject:_loadedDurationsPerItem[i]];
+        } else {
+            [arr addObject:@(-1LL)];
+        }
+    }
+    return [arr copy];
+}
+
+- (void)updateBufferedPositionsPerItem {
+    if (!_indexedAudioSources || _indexedAudioSources.count == 0) return;
+    BOOL shouldBroadcast = NO;
+    int pos = [self getBufferedPosition];
+    if (pos != _bufferedPosition) {
+        _bufferedPosition = pos;
+        shouldBroadcast = YES;
+    }
+    NSArray<NSNumber *> *newArr = [self computeBufferedPositionsPerItem];
+    if (![newArr isEqualToArray:_bufferedPositionsPerItem]) {
+        _bufferedPositionsPerItem = newArr;
+        shouldBroadcast = YES;
+    }
+    if (shouldBroadcast) {
+        [self broadcastPlaybackEvent];
+    }
+}
+
 - (void)broadcastPlaybackEvent {
     [_eventChannel sendEvent:@{
             @"processingState": @(_processingState),
@@ -357,6 +419,8 @@ static const BOOL DEBUG_LOG = NO;
             @"currentIndex": @(_index),
             @"errorCode": _errorCode,
             @"errorMessage": _errorMessage,
+            @"bufferedPositionPerIndex": _bufferedPositionsPerItem ?: @[],
+            @"loadedDurationPerIndex": [self computeLoadedDurationsPerItem],
     }];
 }
 
@@ -604,6 +668,10 @@ static const BOOL DEBUG_LOG = NO;
 
     [self updateEndAction];
 
+    [self startPreloadChain];
+}
+
+- (void)startPreloadChain {
     if (_preloadBufferDurationUs > 0 && _useLazyPreparation
             && _order && _orderInv && _indexedAudioSources.count > 0
             && _index < (int)_orderInv.count) {
@@ -704,6 +772,16 @@ static const BOOL DEBUG_LOG = NO;
             if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: asset loaded for invPos=%ld (sourceIndex=%ld) itemDurationUs=%lld",
                   (long)invPos, (long)si, (long long)itemDurationUs);
 
+            if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur) && si < (NSInteger)strongSelf->_loadedDurationsPerItem.count) {
+                strongSelf->_loadedDurationsPerItem[si] = @(itemDurationUs);
+            }
+            // Pick up any loadedTimeRanges data the item already has (e.g. retained
+            // from a previous queue insertion). When the asset properties were already
+            // cached, loadValuesAsynchronouslyForKeys completes immediately without
+            // triggering new network activity, so the loadedTimeRanges KVO may never
+            // fire. This ensures the buffered positions are still broadcast.
+            [strongSelf updateBufferedPositionsPerItem];
+
             int64_t newAccumulated = accumulatedUs + itemDurationUs;
             BOOL needsMore = (minRemaining - 1 > 0)
                           || (strongSelf->_preloadBufferDurationUs > 0
@@ -742,6 +820,8 @@ static const BOOL DEBUG_LOG = NO;
     _index = (initialIndex != (id)[NSNull null]) ? [initialIndex intValue] : 0;
     _errorCode = (NSNumber *)[NSNull null];
     _errorMessage = (NSString *)[NSNull null];
+    _bufferedPositionsPerItem = nil;
+    _loadedDurationsPerItem = nil;
     // Remove previous observers
     if (_indexedAudioSources) {
         for (int i = 0; i < [_indexedAudioSources count]; i++) {
@@ -785,6 +865,10 @@ static const BOOL DEBUG_LOG = NO;
     }
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
+    _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    for (int i = 0; i < [_indexedAudioSources count]; i++) {
+        [_loadedDurationsPerItem addObject:@(-1LL)];
+    }
     for (int i = 0; i < [_indexedAudioSources count]; i++) {
         IndexedAudioSource *source = _indexedAudioSources[i];
         [self addItemObservers:source.playerItem];
@@ -919,6 +1003,16 @@ static const BOOL DEBUG_LOG = NO;
             status = statusNumber.intValue;
         }
         [playerItem.audioSource onStatusChanged:status];
+        if (status == AVPlayerItemStatusReadyToPlay && _loadedDurationsPerItem) {
+            int itemIndex = [self indexForItem:playerItem];
+            if (itemIndex >= 0 && itemIndex < (int)_loadedDurationsPerItem.count) {
+                CMTime dur = _indexedAudioSources[itemIndex].duration;
+                if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur)) {
+                    int64_t durUs = (int64_t)(CMTimeGetSeconds(dur) * 1e6);
+                    _loadedDurationsPerItem[itemIndex] = @(durUs);
+                }
+            }
+        }
         switch (status) {
             case AVPlayerItemStatusReadyToPlay: {
                 if (playerItem != _player.currentItem) return;
@@ -1101,20 +1195,17 @@ static const BOOL DEBUG_LOG = NO;
                     [self enqueueFrom:_index];
                 } else {
                     [self updateEndAction];
+                    [self startPreloadChain];
                 }
             } else if (!_enqueuedAll) {
                 [self enqueueFrom:_index];
+            } else {
+                [self startPreloadChain];
             }
             _justAdvanced = NO;
         }
     } else if ([keyPath isEqualToString:@"loadedTimeRanges"]) {
-        IndexedPlayerItem *playerItem = (IndexedPlayerItem *)object;
-        if (playerItem != _player.currentItem) return;
-        int pos = [self getBufferedPosition];
-        if (pos != _bufferedPosition) {
-            _bufferedPosition = pos;
-            [self broadcastPlaybackEvent];
-        }
+        [self updateBufferedPositionsPerItem];
     }
 }
 
@@ -1502,6 +1593,8 @@ static const BOOL DEBUG_LOG = NO;
         _indexedAudioSources = nil;
     }
     _audioSource = nil;
+    _bufferedPositionsPerItem = nil;
+    _loadedDurationsPerItem = nil;
     if (_player) {
         [_player removeObserver:self forKeyPath:@"currentItem"];
         if (@available(macOS 10.12, iOS 10.0, *)) {

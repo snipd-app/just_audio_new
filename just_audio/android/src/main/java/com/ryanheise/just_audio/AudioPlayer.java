@@ -862,6 +862,68 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         ((Equalizer)audioEffectsMap.get("AndroidEqualizer")).setBandLevel((short)bandIndex, (short)(Math.round(gain * 100.0))); // target gain needs to be provided in milliBel, the user provides the value in deciBel
     }
 
+    private List<Long> computeBufferedPositionsPerIndex() {
+        if (player == null) return Collections.emptyList();
+        Timeline timeline = player.getCurrentTimeline();
+        int windowCount = timeline.getWindowCount();
+        if (windowCount == 0) return Collections.emptyList();
+
+        int curIdx = player.getCurrentMediaItemIndex();
+        long bufferedPosMs = player.getBufferedPosition();
+        long currentPosMs = player.getCurrentPosition();
+        long totalBufferedMs = player.getTotalBufferedDuration();
+
+        // Future buffer remaining after the buffered portion of the current window
+        long futureMs = Math.max(0, totalBufferedMs - Math.max(0, bufferedPosMs - currentPosMs));
+
+        Timeline.Window window = new Timeline.Window();
+        List<Long> result = new ArrayList<>(windowCount);
+
+        for (int i = 0; i < windowCount; i++) {
+            timeline.getWindow(i, window);
+            long durMs = window.getDurationMs(); // C.TIME_UNSET if unknown
+
+            if (i < curIdx) {
+                // Played items: return their full duration as a proxy for "fully buffered"
+                result.add(durMs == C.TIME_UNSET ? -1L : durMs * 1000L);
+            } else if (i == curIdx) {
+                result.add(bufferedPosMs * 1000L);
+            } else {
+                // Future items: distribute remaining buffer estimate sequentially
+                if (futureMs <= 0) {
+                    result.add(0L);
+                } else if (durMs == C.TIME_UNSET || futureMs >= durMs) {
+                    result.add(durMs == C.TIME_UNSET ? futureMs * 1000L : durMs * 1000L);
+                    if (durMs != C.TIME_UNSET) futureMs -= durMs;
+                } else {
+                    result.add(futureMs * 1000L);
+                    futureMs = 0;
+                }
+            }
+        }
+        return result;
+    }
+
+    private List<Long> computeLoadedDurationsPerIndex() {
+        if (player == null) return Collections.emptyList();
+        Timeline timeline = player.getCurrentTimeline();
+        int windowCount = timeline.getWindowCount();
+        if (windowCount == 0) return Collections.emptyList();
+
+        Timeline.Window window = new Timeline.Window();
+        List<Long> result = new ArrayList<>(windowCount);
+        for (int i = 0; i < windowCount; i++) {
+            timeline.getWindow(i, window);
+            long durMs = window.getDurationMs();
+            if (durMs == C.TIME_UNSET) {
+                result.add(-1L);
+            } else {
+                result.add(durMs * 1000L);
+            }
+        }
+        return result;
+    }
+
     /// Creates an event based on the current state.
     private Map<String, Object> createPlaybackEvent() {
         final Map<String, Object> event = new HashMap<String, Object>();
@@ -877,6 +939,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         event.put("androidAudioSessionId", audioSessionId);
         event.put("errorCode", errorCode);
         event.put("errorMessage", errorMessage);
+        event.put("bufferedPositionPerIndex", computeBufferedPositionsPerIndex());
+        event.put("loadedDurationPerIndex", computeLoadedDurationsPerIndex());
         return event;
     }
 
