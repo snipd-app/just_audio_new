@@ -1358,6 +1358,7 @@ class AudioPlayer {
           _playerEventSubject.add(playerEvent.copyWith(
             playbackEvent: prevPlaybackEvent.copyWith(
               updatePosition: position,
+              currentIndex: index,
               updateTime: DateTime.now(),
             ),
           ));
