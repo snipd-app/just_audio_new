@@ -2247,11 +2247,26 @@ class DarwinLoadControl {
   /// second.
   final double? preferredPeakBitRate;
 
+  /// (iOS/macOS) The total duration of upcoming items for which asset metadata
+  /// (duration, tracks, playability) is proactively loaded via
+  /// `AVAsset.loadValuesAsynchronously`.
+  ///
+  /// At least 1 item ahead of the current item is always preloaded regardless
+  /// of this value. Additional items are preloaded until the sum of their
+  /// durations meets or exceeds [preloadBufferDuration]. Loading stops at a
+  /// hard cap of 20 items to guard against indefinite-duration streams.
+  ///
+  /// Only has effect when [AudioPlayer]'s useLazyPreparation is true (the
+  /// default). Particularly useful when playlist items are short, giving future
+  /// items more time to have their metadata loaded before they are needed.
+  final Duration? preloadBufferDuration;
+
   const DarwinLoadControl({
     this.automaticallyWaitsToMinimizeStalling = true,
     this.preferredForwardBufferDuration,
     this.canUseNetworkResourcesForLiveStreamingWhilePaused = false,
     this.preferredPeakBitRate,
+    this.preloadBufferDuration,
   });
 
   DarwinLoadControlMessage _toMessage() => DarwinLoadControlMessage(
@@ -2261,6 +2276,7 @@ class DarwinLoadControl {
         canUseNetworkResourcesForLiveStreamingWhilePaused:
             canUseNetworkResourcesForLiveStreamingWhilePaused,
         preferredPeakBitRate: preferredPeakBitRate,
+        preloadBufferDuration: preloadBufferDuration,
       );
 }
 

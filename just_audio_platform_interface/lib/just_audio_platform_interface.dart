@@ -939,11 +939,16 @@ class DarwinLoadControlMessage {
   /// second.
   final double? preferredPeakBitRate;
 
+  /// (iOS/macOS) The total duration of upcoming items for which asset metadata
+  /// is proactively loaded. See [DarwinLoadControl.preloadBufferDuration].
+  final Duration? preloadBufferDuration;
+
   DarwinLoadControlMessage({
     required this.automaticallyWaitsToMinimizeStalling,
     required this.preferredForwardBufferDuration,
     required this.canUseNetworkResourcesForLiveStreamingWhilePaused,
     required this.preferredPeakBitRate,
+    required this.preloadBufferDuration,
   });
 
   Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{
@@ -954,6 +959,7 @@ class DarwinLoadControlMessage {
         'canUseNetworkResourcesForLiveStreamingWhilePaused':
             canUseNetworkResourcesForLiveStreamingWhilePaused,
         'preferredPeakBitRate': preferredPeakBitRate,
+        'preloadBufferDuration': preloadBufferDuration?.inMicroseconds,
       };
 }
 

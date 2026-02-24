@@ -14,10 +14,15 @@
 #define TREADMILL_SIZE 2
 #define ERROR_ABORT 10000000
 
+static const BOOL DEBUG_LOG = NO;
+
 // TODO: Check for and report invalid state transitions.
 // TODO: Apply Apple's guidance on seeking: https://developer.apple.com/library/archive/qa/qa1820/_index.html
+
 @implementation AudioPlayer {
     NSObject<FlutterPluginRegistrar>* _registrar;
+    int64_t _preloadBufferDurationUs;
+    NSInteger _preloadGeneration;
     FlutterMethodChannel *_methodChannel;
     BetterEventChannel *_eventChannel;
     BetterEventChannel *_dataEventChannel;
@@ -100,6 +105,8 @@
             _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused = (BOOL)[map[@"canUseNetworkResourcesForLiveStreamingWhilePaused"] boolValue];
             _loadControl.preferredPeakBitRate = (NSNumber *)map[@"preferredPeakBitRate"];
             _automaticallyWaitsToMinimizeStalling = (BOOL)[map[@"automaticallyWaitsToMinimizeStalling"] boolValue];
+            NSNumber *preloadBufferDuration = map[@"preloadBufferDuration"];
+            _preloadBufferDurationUs = (preloadBufferDuration && preloadBufferDuration != (id)[NSNull null]) ? [preloadBufferDuration longLongValue] : 0;
         }
     }
     if (!_loadControl) {
@@ -596,6 +603,126 @@
     }
 
     [self updateEndAction];
+
+    if (_preloadBufferDurationUs > 0 && _useLazyPreparation
+            && _order && _orderInv && _indexedAudioSources.count > 0
+            && _index < (int)_orderInv.count) {
+        _preloadGeneration++;
+        NSInteger generation = _preloadGeneration;
+        NSInteger invPos = [_orderInv[_index] integerValue];
+        [self _enqueueAndLoadFromInvPos:invPos + 1
+                           accumulatedUs:0
+                           minRemaining:1
+                             generation:generation
+                            itemsLoaded:0];
+    }
+}
+
+/// Enqueues the item at invPos into the AVQueuePlayer (if not already present),
+/// then loads its asset metadata. In the completion callback, decides whether to
+/// enqueue and load the next item based on the accumulated duration so far.
+/// Continues until:
+///   - minRemaining drops to 0 AND accumulatedUs >= _preloadBufferDurationUs, OR
+///   - itemsLoaded reaches kMaxEnqueueItems (guard against indefinite streams), OR
+///   - there are no more items in the order array.
+- (void)_enqueueAndLoadFromInvPos:(NSInteger)invPos
+                      accumulatedUs:(int64_t)accumulatedUs
+                      minRemaining:(NSInteger)minRemaining
+                         generation:(NSInteger)generation
+                        itemsLoaded:(NSInteger)itemsLoaded {
+    static const NSInteger kMaxEnqueueItems = 20;
+    if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: invPos=%ld accumulatedUs=%lld minRemaining=%ld generation=%ld itemsLoaded=%ld orderCount=%ld",
+          (long)invPos, (long long)accumulatedUs, (long)minRemaining, (long)generation, (long)itemsLoaded, (long)_order.count);
+
+    if (invPos >= (NSInteger)_order.count) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: STOP — invPos(%ld) >= orderCount(%ld)", (long)invPos, (long)_order.count);
+        return;
+    }
+    if (itemsLoaded >= kMaxEnqueueItems) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: STOP — itemsLoaded(%ld) reached kMaxEnqueueItems(%ld)", (long)itemsLoaded, (long)kMaxEnqueueItems);
+        return;
+    }
+
+    NSInteger si = [_order[invPos] integerValue];
+    if (si >= (NSInteger)_indexedAudioSources.count) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: STOP — sourceIndex(%ld) >= indexedAudioSources.count(%ld)", (long)si, (long)_indexedAudioSources.count);
+        return;
+    }
+
+    IndexedAudioSource *source = _indexedAudioSources[si];
+    AVPlayerItem *item = source.playerItem;
+    if (!item) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: STOP — playerItem is nil for sourceIndex=%ld", (long)si);
+        return;
+    }
+
+    // Enqueue the item before loading metadata so that AVQueuePlayer can begin
+    // preparing it. Skip if it is already in the queue (e.g. the item immediately
+    // after the current one, which was inserted by the synchronous part of enqueueFrom:).
+    if (![_player.items containsObject:item]) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: inserting item at invPos=%ld (sourceIndex=%ld) into AVQueuePlayer", (long)invPos, (long)si);
+        [_player insertItem:item afterItem:nil];
+    } else {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: item at invPos=%ld (sourceIndex=%ld) already in queue, skipping insert", (long)invPos, (long)si);
+    }
+
+    AVAsset *asset = item.asset;
+    if (!asset) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: STOP — asset is nil for invPos=%ld (sourceIndex=%ld)", (long)invPos, (long)si);
+        return;
+    }
+
+    if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: loading duration+playable async for invPos=%ld (sourceIndex=%ld)", (long)invPos, (long)si);
+    __weak typeof(self) weakSelf = self;
+    [asset loadValuesAsynchronouslyForKeys:@[@"duration", @"playable"] completionHandler:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            // Cancel if a newer enqueue cycle has already started.
+            if (generation != strongSelf->_preloadGeneration) {
+                if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: CANCELLED — generation mismatch (got %ld, current %ld) for invPos=%ld",
+                      (long)generation, (long)strongSelf->_preloadGeneration, (long)invPos);
+                return;
+            }
+            if (!strongSelf->_order || invPos >= (NSInteger)strongSelf->_order.count) {
+                if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: CANCELLED — order gone or invPos(%ld) out of range after async load", (long)invPos);
+                return;
+            }
+
+            // Prefer source.duration so that ClippingAudioSource returns its clipped
+            // duration rather than the full file duration. Fall back to asset.duration
+            // (guaranteed loaded at this point) for sources whose playerItem.duration
+            // isn't set until the item becomes ready to play.
+            int64_t itemDurationUs = 0;
+            CMTime dur = source.duration;
+            if (!CMTIME_IS_VALID(dur) || CMTIME_IS_INDEFINITE(dur)) {
+                dur = asset.duration;
+            }
+            if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur)) {
+                itemDurationUs = (int64_t)(CMTimeGetSeconds(dur) * 1e6);
+            }
+            if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: asset loaded for invPos=%ld (sourceIndex=%ld) itemDurationUs=%lld",
+                  (long)invPos, (long)si, (long long)itemDurationUs);
+
+            int64_t newAccumulated = accumulatedUs + itemDurationUs;
+            BOOL needsMore = (minRemaining - 1 > 0)
+                          || (strongSelf->_preloadBufferDurationUs > 0
+                              && newAccumulated < strongSelf->_preloadBufferDurationUs);
+            if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: newAccumulatedUs=%lld preloadBufferUs=%lld needsMore=%d",
+                  (long long)newAccumulated, (long long)strongSelf->_preloadBufferDurationUs, needsMore);
+
+            if (needsMore) {
+                [strongSelf _enqueueAndLoadFromInvPos:invPos + 1
+                                         accumulatedUs:newAccumulated
+                                         minRemaining:MAX((NSInteger)0, minRemaining - 1)
+                                           generation:generation
+                                          itemsLoaded:itemsLoaded + 1];
+            } else {
+                if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: DONE — preload complete at invPos=%ld, totalLoaded=%ld, accumulatedUs=%lld",
+                      (long)invPos, (long)(itemsLoaded + 1), (long long)newAccumulated);
+            }
+        });
+    }];
 }
 
 - (void)updatePosition {
