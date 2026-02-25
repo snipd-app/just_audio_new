@@ -12,5 +12,7 @@
 @property (readonly, nonatomic) NSString *uri;
 
 - (instancetype)initWithId:(NSString *)sid uri:(NSString *)uri loadControl:(LoadControl *)loadControl headers:(NSDictionary *)headers options:(NSDictionary *)options;
+- (IndexedPlayerItem *)recreatePlayerItem;
+- (void)clearPlayerItem2;
 
 @end

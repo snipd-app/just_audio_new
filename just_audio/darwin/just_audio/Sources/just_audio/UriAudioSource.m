@@ -127,6 +127,17 @@
     }
 }
 
+- (IndexedPlayerItem *)recreatePlayerItem {
+    IndexedPlayerItem *oldItem = _playerItem;
+    _playerItem = [self createPlayerItem:_uri];
+    _playerItem.audioSource = oldItem.audioSource;
+    return oldItem;
+}
+
+- (void)clearPlayerItem2 {
+    _playerItem2 = nil;
+}
+
 - (IndexedPlayerItem *)playerItem {
     return _playerItem;
 }

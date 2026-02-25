@@ -7,6 +7,7 @@
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
@@ -37,12 +38,16 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   double _preloadBufferSeconds = 20.0;
   double _preferredForwardBufferSeconds = 20.0;
   bool _autoPlay = false;
+  int _failCount = 5;
   List<Duration> _bufferedPerIndex = const [];
   List<Duration?> _durationPerIndex = const [];
   Map<int, int> _playDelayPerIndex = {};
   DateTime? _indexChangeTime;
   int? _pendingDelayIndex;
   Duration? _pendingBaselinePosition;
+  String? _lastError;
+  final List<(FailableUriAudioSource, VoidCallback)> _attemptsSubscriptions =
+      [];
 
   List<AudioSource> _buildPlaylist() => [
         AudioSource.uri(
@@ -71,12 +76,13 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             duration: const Duration(milliseconds: 1000),
             tag: AudioMetadata(
                 album: "Silence 2", title: "Silence 2", artwork: "")),
-        AudioSource.uri(
-          Uri.parse(
+        FailableUriAudioSource(
+          uri: Uri.parse(
               "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/01__11dabf89a28b435288bafe86080d1a95.mp3"),
+          failCount: _failCount,
           tag: AudioMetadata(
-            album: "AI DJ - Highlight 1 - Intro",
-            title: "AI DJ - Highlight 1 - Intro",
+            album: "AI DJ - Highlight 1 - Intro (Failable)",
+            title: "AI DJ - Highlight 1 - Intro (Failable)",
             artwork: "",
           ),
         ),
@@ -170,6 +176,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       _bufferedPerIndex = const [];
       _durationPerIndex = const [];
       _playDelayPerIndex = {};
+      _lastError = null;
     });
     _pendingDelayIndex = null;
     _indexChangeTime = null;
@@ -182,6 +189,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     await session.configure(const AudioSessionConfiguration.speech());
     _player.errorStream.listen((e) {
       print('A stream error occurred: $e');
+      setState(() => _lastError = e.toString());
     });
 
     int? lastSeenIndex;
@@ -224,7 +232,9 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
         _pendingDelayIndex = 0;
         _pendingBaselinePosition = null;
       }
-      await _player.setAudioSources(_buildPlaylist());
+      final playlist = _buildPlaylist();
+      _subscribeToAttemptsNotifiers(playlist);
+      await _player.setAudioSources(playlist);
       if (_autoPlay) {
         _player.play();
       }
@@ -239,6 +249,21 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     _player.loadedDurationPerIndexStream.listen((list) {
       setState(() => _durationPerIndex = list);
     });
+  }
+
+  void _subscribeToAttemptsNotifiers(List<AudioSource> playlist) {
+    for (final (source, cb) in _attemptsSubscriptions) {
+      source.attemptsNotifier.removeListener(cb);
+    }
+    _attemptsSubscriptions.clear();
+
+    for (final source in playlist) {
+      if (source is FailableUriAudioSource) {
+        void cb() => setState(() {});
+        source.attemptsNotifier.addListener(cb);
+        _attemptsSubscriptions.add((source, cb));
+      }
+    }
   }
 
   void _onPlayPressed() {
@@ -269,18 +294,38 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
         : '${s.toStringAsFixed(1)}s';
   }
 
-  Widget? _buildItemSubtitle(int i) {
+  Widget? _buildItemSubtitle(int i, AudioSource source) {
     final buf = i < _bufferedPerIndex.length ? _bufferedPerIndex[i] : null;
     final dur = i < _durationPerIndex.length ? _durationPerIndex[i] : null;
 
     final delay = _playDelayPerIndex[i];
+    final retries = source is FailableUriAudioSource ? source.attempts : null;
 
-    if (buf == null && delay == null) return null;
+    if (buf == null && delay == null && retries == null) return null;
+
+    final retryWidget = retries != null
+        ? Text(
+            'retries: $retries/${source is FailableUriAudioSource ? (source).failCount : 0}',
+            style: TextStyle(
+              fontSize: 11,
+              color: retries >= (source as FailableUriAudioSource).failCount
+                  ? Colors.green.shade700
+                  : Colors.red.shade700,
+            ),
+          )
+        : null;
 
     if (buf == null) {
-      return Text(
-        'play delay: ${delay}ms',
-        style: TextStyle(fontSize: 11, color: Colors.orange.shade700),
+      return Row(
+        children: [
+          if (delay != null)
+            Text(
+              'play delay: ${delay}ms',
+              style: TextStyle(fontSize: 11, color: Colors.orange.shade700),
+            ),
+          if (delay != null && retryWidget != null) const SizedBox(width: 8),
+          if (retryWidget != null) retryWidget,
+        ],
       );
     }
 
@@ -319,6 +364,10 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 style: TextStyle(fontSize: 11, color: Colors.orange.shade700),
               ),
             ],
+            if (retryWidget != null) ...[
+              const SizedBox(width: 8),
+              retryWidget,
+            ],
           ],
         ),
       ],
@@ -327,6 +376,10 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    for (final (source, cb) in _attemptsSubscriptions) {
+      source.attemptsNotifier.removeListener(cb);
+    }
+    _attemptsSubscriptions.clear();
     ambiguate(WidgetsBinding.instance)!.removeObserver(this);
     _player.dispose();
     super.dispose();
@@ -382,6 +435,43 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                     value: _autoPlay,
                     onChanged: (v) => setState(() => _autoPlay = v),
                   ),
+                  if (_lastError != null) ...[
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: GestureDetector(
+                        onTap: () => setState(() => _lastError = null),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.red.shade50,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: Colors.red.shade200),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.error_outline,
+                                  size: 14, color: Colors.red.shade700),
+                              const SizedBox(width: 4),
+                              Flexible(
+                                child: Text(
+                                  _lastError!,
+                                  style: TextStyle(
+                                      fontSize: 11, color: Colors.red.shade700),
+                                  overflow: TextOverflow.ellipsis,
+                                  maxLines: 1,
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              Icon(Icons.close,
+                                  size: 12, color: Colors.red.shade400),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ],
               ),
               StreamBuilder<PositionData>(
@@ -424,6 +514,18 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 value: _preferredForwardBufferSeconds,
                 onChanged: (v) =>
                     setState(() => _preferredForwardBufferSeconds = v),
+              ),
+              _IntSlider(
+                label: 'Fail count',
+                value: _failCount,
+                min: 0,
+                max: 20,
+                onChanged: (v) async {
+                  setState(() => _failCount = v);
+                  final playlist = _buildPlaylist();
+                  _subscribeToAttemptsNotifiers(playlist);
+                  await _player.setAudioSources(playlist);
+                },
               ),
               const SizedBox(height: 4.0),
               Row(
@@ -492,6 +594,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                     final seqState = snapshot.data;
                     final sequence = seqState?.sequence ?? [];
 
+                    print('>> currentIndex: ${seqState?.currentIndex}');
                     return ReorderableListView(
                       onReorder: (int oldIndex, int newIndex) {
                         if (oldIndex < newIndex) newIndex--;
@@ -517,7 +620,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                                   : null,
                               child: ListTile(
                                 title: Text(sequence[i].tag.title as String),
-                                subtitle: _buildItemSubtitle(i),
+                                subtitle: _buildItemSubtitle(i, sequence[i]),
                                 onTap: () => _player
                                     .seek(Duration.zero, index: i)
                                     .catchError((e, st) {}),
@@ -707,6 +810,49 @@ class _BufferSlider extends StatelessWidget {
   }
 }
 
+class _IntSlider extends StatelessWidget {
+  final String label;
+  final int value;
+  final int min;
+  final int max;
+  final ValueChanged<int> onChanged;
+
+  const _IntSlider({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16.0),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 148,
+            child: Text(
+              '$label: $value',
+              style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+            ),
+          ),
+          Expanded(
+            child: Slider(
+              value: value.toDouble(),
+              min: min.toDouble(),
+              max: max.toDouble(),
+              divisions: max - min,
+              onChanged: (v) => onChanged(v.round()),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class AudioMetadata {
   final String album;
   final String title;
@@ -817,6 +963,58 @@ class SilenceStreamAudioSource extends StreamAudioSource {
       offset: start,
       stream: Stream.value(Uint8List.sublistView(bytes, start, end)),
       contentType: 'audio/wav',
+    );
+  }
+}
+
+/// A [StreamAudioSource] that proxies audio from a remote [uri] but is
+/// preconfigured to fail the first [failCount] calls to [request] before
+/// returning real data. Useful for testing retry/error-recovery behaviour.
+class FailableUriAudioSource extends StreamAudioSource {
+  final Uri uri;
+  final int failCount;
+  final attemptsNotifier = ValueNotifier<int>(0);
+  int get attempts => attemptsNotifier.value;
+  Uint8List? _cachedBytes;
+  String _contentType = 'audio/mpeg';
+
+  FailableUriAudioSource({
+    required this.uri,
+    this.failCount = 0,
+    dynamic tag,
+  }) : super(tag: tag);
+
+  @override
+  Future<StreamAudioResponse> request([int? start, int? end]) async {
+    if (failCount == -1 || attemptsNotifier.value < failCount) {
+      attemptsNotifier.value++;
+      await Future.delayed(const Duration(milliseconds: 2000));
+      throw Exception(
+          '>> FailableUriAudioSource: simulated failure ${attemptsNotifier.value}/$failCount');
+    }
+
+    if (_cachedBytes == null) {
+      final client = HttpClient();
+      try {
+        final req = await client.getUrl(uri);
+        final response = await req.close();
+        _contentType = response.headers.contentType?.mimeType ?? 'audio/mpeg';
+        _cachedBytes = await consolidateHttpClientResponseBytes(response);
+      } finally {
+        client.close();
+      }
+    }
+
+    final bytes = _cachedBytes!;
+    start ??= 0;
+    end ??= bytes.length;
+
+    return StreamAudioResponse(
+      sourceLength: bytes.length,
+      contentLength: end - start,
+      offset: start,
+      stream: Stream.value(Uint8List.sublistView(bytes, start, end)),
+      contentType: _contentType,
     );
   }
 }

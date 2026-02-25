@@ -409,6 +409,7 @@ static const BOOL DEBUG_LOG = NO;
 }
 
 - (void)broadcastPlaybackEvent {
+    if (DEBUG_LOG) NSLog(@"broadcastPlaybackEvent: _index=%d, _processingState=%ld", _index, (long)_processingState);
     [_eventChannel sendEvent:@{
             @"processingState": @(_processingState),
             @"updatePosition": @((long long)1000 * _updatePosition),
@@ -471,7 +472,6 @@ static const BOOL DEBUG_LOG = NO;
     [playerItem removeObserver:self forKeyPath:@"playbackBufferEmpty"];
     [playerItem removeObserver:self forKeyPath:@"playbackBufferFull"];
     [playerItem removeObserver:self forKeyPath:@"loadedTimeRanges"];
-    //[playerItem removeObserver:self forKeyPath:@"playbackLikelyToKeepUp"];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemDidPlayToEndTimeNotification object:playerItem];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemFailedToPlayToEndTimeNotification object:playerItem];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVPlayerItemPlaybackStalledNotification object:playerItem];
@@ -973,20 +973,43 @@ static const BOOL DEBUG_LOG = NO;
     if (_loopMode == lmLoopOne) {
         [endedSource seek:kCMTimeZero];
         _justAdvanced = YES;
-    } else if (_loopMode == lmLoopAll) {
-        [endedSource seek:kCMTimeZero];
-        _index = [_order[([_orderInv[_index] intValue] + 1) % _order.count] intValue];
-        [self broadcastPlaybackEvent];
-        _justAdvanced = YES;
-    } else if ([_orderInv[_index] intValue] + 1 < [_order count]) {
-        [endedSource seek:kCMTimeZero];
-        _index = [_order[([_orderInv[_index] intValue] + 1)] intValue];
-        [self updateEndAction];
-        [self broadcastPlaybackEvent];
-        _justAdvanced = YES;
     } else {
-        // reached end of playlist
-        [self complete];
+        int nextIndex;
+        BOOL hasNext;
+        if (_loopMode == lmLoopAll) {
+            nextIndex = [_order[([_orderInv[_index] intValue] + 1) % _order.count] intValue];
+            hasNext = YES;
+        } else if ([_orderInv[_index] intValue] + 1 < [_order count]) {
+            nextIndex = [_order[([_orderInv[_index] intValue] + 1)] intValue];
+            hasNext = YES;
+        } else {
+            nextIndex = -1;
+            hasNext = NO;
+        }
+
+        if (hasNext && nextIndex >= 0 && nextIndex < (int)_indexedAudioSources.count) {
+            IndexedPlayerItem *nextPlayerItem = _indexedAudioSources[nextIndex].playerItem;
+            if (nextPlayerItem.status == AVPlayerItemStatusFailed) {
+                _playing = NO;
+                [_player pause];
+                _index = nextIndex;
+                [self updatePosition];
+                [self sendErrorForItem:nextPlayerItem];
+                return;
+            }
+        }
+
+        if (hasNext) {
+            [endedSource seek:kCMTimeZero];
+            _index = nextIndex;
+            if (_loopMode != lmLoopAll) {
+                [self updateEndAction];
+            }
+            [self broadcastPlaybackEvent];
+            _justAdvanced = YES;
+        } else {
+            [self complete];
+        }
     }
 }
 
@@ -1015,7 +1038,9 @@ static const BOOL DEBUG_LOG = NO;
         }
         switch (status) {
             case AVPlayerItemStatusReadyToPlay: {
-                if (playerItem != _player.currentItem) return;
+                if (playerItem != _player.currentItem) {
+                    return;
+                }
                 // Detect buffering in different ways depending on whether we're playing
                 if (_playing) {
                     if (@available(macOS 10.12, iOS 10.0, *)) {
@@ -1059,7 +1084,19 @@ static const BOOL DEBUG_LOG = NO;
             case AVPlayerItemStatusFailed: {
                 //NSLog(@"AVPlayerItemStatusFailed on item [%d]", [self indexForItem:playerItem]);
                 if (playerItem == _player.currentItem) {
-                    [self sendErrorForItem:playerItem];
+                    [self pause];
+                    _errorCode = @((int)playerItem.error.code);
+                    _errorMessage = playerItem.error.localizedDescription;
+                    [self broadcastPlaybackEvent];
+                    if (_loadResult) {
+                        FlutterError *flutterError = [FlutterError errorWithCode:[NSString stringWithFormat:@"%@", _errorCode]
+                                                                         message:_errorMessage
+                                                                         details:@{@"index": @(_index)}];
+                        _loadResult(flutterError);
+                        _loadResult = nil;
+                    }
+                } else {
+                    [self handleNonCurrentItemFailed:playerItem];
                 }
                 break;
             }
@@ -1126,21 +1163,25 @@ static const BOOL DEBUG_LOG = NO;
             }
         }
     } else if ([keyPath isEqualToString:@"currentItem"] && _player.currentItem) {
-        //NSLog(@"currentItem -> [%d]", [self indexForItem:_player.currentItem]);
+        if (DEBUG_LOG) NSLog(@"currentItem KVO -> new item [%d], _index=%d, status=%ld",
+                            [self indexForItem:(IndexedPlayerItem *)change[NSKeyValueChangeNewKey]],
+                            _index,
+                            (long)((IndexedPlayerItem *)change[NSKeyValueChangeNewKey]).status);
         IndexedPlayerItem *playerItem = (IndexedPlayerItem *)change[NSKeyValueChangeNewKey];
         //IndexedPlayerItem *oldPlayerItem = (IndexedPlayerItem *)change[NSKeyValueChangeOldKey];
         if (playerItem.status == AVPlayerItemStatusFailed) {
+            if (DEBUG_LOG) NSLog(@"currentItem KVO: new current item [%d] is failed — calling sendErrorForItem",
+                                [self indexForItem:playerItem]);
             [self sendErrorForItem:playerItem];
             return;
         } else {
             int expectedIndex = [self indexForItem:playerItem];
             if (_index != expectedIndex) {
-                // AVQueuePlayer will sometimes skip over error items without
-                // notifying this observer.
-                //NSLog(@"Queue change detected. Adjusting index from %d -> %d", _index, expectedIndex);
                 _index = expectedIndex;
                 [self updateEndAction];
                 [self broadcastPlaybackEvent];
+            } else {
+                if (DEBUG_LOG) NSLog(@"currentItem KVO: index unchanged at %d", _index);
             }
         }
         //NSLog(@"currentItem changed. _index=%d", _index);
@@ -1209,8 +1250,56 @@ static const BOOL DEBUG_LOG = NO;
     }
 }
 
+// Called when an AVPlayerItem that is queued but not yet current fails to load.
+// Updates the end action so AVQueuePlayer pauses instead of silently skipping
+// the failed item. For playerItem2 (loop copies), removes and clears them.
+- (void)handleNonCurrentItemFailed:(IndexedPlayerItem *)playerItem {
+    int itemIndex = [self indexForItem:playerItem];
+
+    if (itemIndex < 0 || itemIndex >= (int)_indexedAudioSources.count) {
+        [_player removeItem:playerItem];
+        @try { [self removeItemObservers:playerItem]; } @catch (NSException *e) {
+            if (DEBUG_LOG) NSLog(@"exception removing observers for dropped item: %@", e);
+        }
+        return;
+    }
+
+    IndexedAudioSource *source = _indexedAudioSources[itemIndex];
+    BOOL isItem2 = (playerItem == source.playerItem2);
+
+    if (isItem2) {
+        if (DEBUG_LOG) NSLog(@"playerItem2 for source [%d] failed — clearing (error: %@)",
+                             itemIndex, playerItem.error.localizedDescription);
+        [_player removeItem:playerItem];
+        @try { [self removeItemObservers:playerItem]; } @catch (NSException *e) {
+            if (DEBUG_LOG) NSLog(@"exception removing observers: %@", e);
+        }
+        UriAudioSource *uriSource = nil;
+        if ([source isKindOfClass:[ClippingAudioSource class]]) {
+            uriSource = ((ClippingAudioSource *)source).audioSource;
+        } else if ([source isKindOfClass:[UriAudioSource class]]) {
+            uriSource = (UriAudioSource *)source;
+        }
+        if (uriSource) [uriSource clearPlayerItem2];
+        [self updateEndAction];
+        return;
+    }
+
+    if (DEBUG_LOG) NSLog(@"non-current item [%d] failed (error: %@) — will pause before it",
+                         itemIndex, playerItem.error.localizedDescription);
+    [self updateEndAction];
+}
+
 - (void)sendErrorForItem:(IndexedPlayerItem *)playerItem {
-    [self sendError:@((int)playerItem.error.code) errorMessage:playerItem.error.localizedDescription playerItem:playerItem switchToIdle:YES];
+    NSError *error = playerItem.error;
+    int itemIndex = [self indexForItem:playerItem];
+    if (DEBUG_LOG) NSLog(@"sendErrorForItem: itemIndex=%d, _index=%d, error=%@, errorCode=%ld",
+                        itemIndex, _index, error.localizedDescription, (long)(error ? error.code : -1));
+    _index = itemIndex;
+    NSNumber *code = error ? @((int)error.code) : @(-1);
+    NSString *message = error.localizedDescription ?: @"Unknown error";
+    [self sendError:code errorMessage:message playerItem:playerItem switchToIdle:YES];
+    if (DEBUG_LOG) NSLog(@"sendErrorForItem: removing all items from player, _index=%d", _index);
     [_player removeAllItems];
 }
 
@@ -1220,8 +1309,8 @@ static const BOOL DEBUG_LOG = NO;
                                                      message:errorMessage
                                                      details:playerItem != nil ? @{@"index": @([self indexForItem:playerItem])} : nil];
     [_eventChannel sendEvent:flutterError];
-    _errorCode = errorCode;
-    _errorMessage = errorMessage;
+    _errorCode = errorCode ?: (NSNumber *)[NSNull null];
+    _errorMessage = errorMessage ?: (NSString *)[NSNull null];
     if (switchToIdle) {
         _processingState = psIdle;
     }
@@ -1346,16 +1435,41 @@ static const BOOL DEBUG_LOG = NO;
     [self enqueueFrom:_index];
 }
 
+// Returns YES if the item immediately after _index in the play order has a
+// failed playerItem. Used by updateEndAction and onComplete to decide whether
+// advancing is safe.
+- (BOOL)isNextItemFailed {
+    if (!_order || _order.count == 0 || !_indexedAudioSources || !_orderInv) return NO;
+    int orderPos = [_orderInv[_index] intValue];
+    int nextOrderPos = -1;
+    if (_loopMode == lmLoopAll) {
+        nextOrderPos = (orderPos + 1) % (int)_order.count;
+    } else if (orderPos + 1 < (int)_order.count) {
+        nextOrderPos = orderPos + 1;
+    }
+    if (nextOrderPos < 0) return NO;
+    int nextSourceIndex = [_order[nextOrderPos] intValue];
+    if (nextSourceIndex >= (int)_indexedAudioSources.count) return NO;
+    IndexedAudioSource *nextSource = _indexedAudioSources[nextSourceIndex];
+    return (nextSource.playerItem && nextSource.playerItem.status == AVPlayerItemStatusFailed);
+}
+
 - (void)updateEndAction {
     // Should be called in the following situations:
     // - when the audio source changes
     // - when _index changes
     // - when the loop mode changes.
-    // - when the shuffle order changes. (TODO)
     // - when the shuffle mode changes.
+    // - when a non-current item fails.
     if (!_player) return;
     if (_audioSource && (_loopMode != lmLoopOff || ([_order count] > 0 && [_orderInv[_index] intValue] + 1 < [_order count]))) {
-        _player.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
+        // If the next item has failed, pause at the end of the current item
+        // so AVQueuePlayer does not silently skip over it.
+        if ([self isNextItemFailed]) {
+            _player.actionAtItemEnd = AVPlayerActionAtItemEndPause;
+        } else {
+            _player.actionAtItemEnd = AVPlayerActionAtItemEndAdvance;
+        }
     } else {
         _player.actionAtItemEnd = AVPlayerActionAtItemEndPause; // AVPlayerActionAtItemEndNone
     }
