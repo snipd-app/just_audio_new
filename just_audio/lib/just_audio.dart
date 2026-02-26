@@ -137,6 +137,10 @@ class AudioPlayer {
   final _durationSubject = BehaviorSubject<Duration?>.seeded(null);
   final _bufferedPositionSubject =
       BehaviorSubject<Duration>.seeded(Duration.zero);
+  final _bufferedPositionPerIndexSubject =
+      BehaviorSubject<List<Duration>>.seeded(const []);
+  final _loadedDurationPerIndexSubject =
+      BehaviorSubject<List<Duration?>>.seeded(const []);
   final _icyMetadataSubject = BehaviorSubject<IcyMetadata?>.seeded(null);
   final _androidAudioSessionIdSubject = BehaviorSubject<int?>.seeded(null);
   final _errorSubject = PublishSubject<PlayerException>();
@@ -282,6 +286,12 @@ class AudioPlayer {
         playbackEventStream.map((event) => event.processingState).distinct());
     _bufferedPositionSubject.addStream(
         playbackEventStream.map((event) => event.bufferedPosition).distinct());
+    _bufferedPositionPerIndexSubject.addStream(playbackEventStream
+        .map((event) => event.bufferedPositionPerIndex)
+        .distinct());
+    _loadedDurationPerIndexSubject.addStream(playbackEventStream
+        .map((event) => event.loadedDurationPerIndex)
+        .distinct(_listEquals));
     _icyMetadataSubject.addStream(
         playbackEventStream.map((event) => event.icyMetadata).distinct());
     _positionDiscontinuitySubscription = playbackEventStream
@@ -524,6 +534,36 @@ class AudioPlayer {
   /// A stream of buffered positions.
   Stream<Duration> get bufferedPositionStream =>
       _bufferedPositionSubject.stream.distinct();
+
+  /// The buffered end-position for each indexed audio source in the current
+  /// playlist. Index `i` reflects how far source `i` has been buffered.
+  ///
+  /// Returns an empty list when no sources are loaded or the platform does not
+  /// support this feature.
+  List<Duration> get bufferedPositionPerIndex =>
+      _bufferedPositionPerIndexSubject.nvalue ?? const [];
+
+  /// A stream of per-index buffered positions.
+  ///
+  /// Each emission is a list with one entry per indexed audio source, holding
+  /// the buffered end-position for that source.
+  Stream<List<Duration>> get bufferedPositionPerIndexStream =>
+      _bufferedPositionPerIndexSubject.stream.distinct();
+
+  /// The loaded duration for each indexed audio source in the current playlist.
+  /// Index `i` holds the duration of source `i` once its metadata has been
+  /// loaded, or `null` if the duration is not yet known.
+  ///
+  /// Returns an empty list when no sources are loaded.
+  List<Duration?> get loadedDurationPerIndex =>
+      _loadedDurationPerIndexSubject.nvalue ?? const [];
+
+  /// A stream of per-index loaded durations.
+  ///
+  /// Each emission is a list with one entry per indexed audio source. An entry
+  /// is `null` until the duration metadata for that source has been loaded.
+  Stream<List<Duration?>> get loadedDurationPerIndexStream =>
+      _loadedDurationPerIndexSubject.stream.distinct(_listEquals);
 
   /// The latest ICY metadata received through the audio source, or `null` if no
   /// metadata is available.
@@ -1318,6 +1358,7 @@ class AudioPlayer {
           _playerEventSubject.add(playerEvent.copyWith(
             playbackEvent: prevPlaybackEvent.copyWith(
               updatePosition: position,
+              currentIndex: index,
               updateTime: DateTime.now(),
             ),
           ));
@@ -1448,6 +1489,8 @@ class AudioPlayer {
       await _durationSubject.close();
       await _processingStateSubject.close();
       await _bufferedPositionSubject.close();
+      await _bufferedPositionPerIndexSubject.close();
+      await _loadedDurationPerIndexSubject.close();
       await _icyMetadataSubject.close();
       await _androidAudioSessionIdSubject.close();
       await _errorSubject.close();
@@ -1582,6 +1625,8 @@ class AudioPlayer {
           androidAudioSessionId: message.androidAudioSessionId,
           errorCode: message.errorCode,
           errorMessage: message.errorMessage,
+          bufferedPositionPerIndex: message.bufferedPositionPerIndex,
+          loadedDurationPerIndex: message.loadedDurationPerIndex,
         );
         _loadFuture = Future.value(newPlaybackEvent.duration);
         if (newPlaybackEvent == playbackEvent) {
@@ -1927,6 +1972,17 @@ class PlaybackEvent {
   /// documentation of the respective platform implementation.
   final String? errorMessage;
 
+  /// The buffered end-position for each indexed audio source in the playlist.
+  ///
+  /// Index `i` holds how far source `i` has been buffered. An empty list is
+  /// returned when no sources are loaded or the platform does not support this
+  /// feature.
+  final List<Duration> bufferedPositionPerIndex;
+
+  /// The loaded duration for each indexed audio source in the playlist.
+  /// An entry is `null` when the duration of that source is not yet known.
+  final List<Duration?> loadedDurationPerIndex;
+
   PlaybackEvent({
     this.processingState = ProcessingState.idle,
     DateTime? updateTime,
@@ -1938,6 +1994,8 @@ class PlaybackEvent {
     this.androidAudioSessionId,
     this.errorCode,
     this.errorMessage,
+    this.bufferedPositionPerIndex = const [],
+    this.loadedDurationPerIndex = const [],
   }) : updateTime = updateTime ?? DateTime.now();
 
   /// Returns a copy of this event with given properties replaced.
@@ -1952,6 +2010,8 @@ class PlaybackEvent {
     int? androidAudioSessionId,
     int? errorCode,
     String? errorMessage,
+    List<Duration>? bufferedPositionPerIndex,
+    List<Duration?>? loadedDurationPerIndex,
   }) =>
       PlaybackEvent(
         processingState: processingState ?? this.processingState,
@@ -1965,10 +2025,14 @@ class PlaybackEvent {
             androidAudioSessionId ?? this.androidAudioSessionId,
         errorCode: errorCode ?? this.errorCode,
         errorMessage: errorMessage ?? this.errorMessage,
+        bufferedPositionPerIndex:
+            bufferedPositionPerIndex ?? this.bufferedPositionPerIndex,
+        loadedDurationPerIndex:
+            loadedDurationPerIndex ?? this.loadedDurationPerIndex,
       );
 
   @override
-  int get hashCode => Object.hash(
+  int get hashCode => Object.hashAll([
         processingState,
         updateTime,
         updatePosition,
@@ -1979,7 +2043,9 @@ class PlaybackEvent {
         androidAudioSessionId,
         errorCode,
         errorMessage,
-      );
+        ...bufferedPositionPerIndex,
+        ...loadedDurationPerIndex,
+      ]);
 
   @override
   bool operator ==(Object other) =>
@@ -1994,11 +2060,21 @@ class PlaybackEvent {
       currentIndex == other.currentIndex &&
       androidAudioSessionId == other.androidAudioSessionId &&
       errorCode == other.errorCode &&
-      errorMessage == other.errorMessage;
+      errorMessage == other.errorMessage &&
+      _listEquals(bufferedPositionPerIndex, other.bufferedPositionPerIndex) &&
+      _listEquals(loadedDurationPerIndex, other.loadedDurationPerIndex);
 
   @override
   String toString() =>
       "{processingState=$processingState, updateTime=$updateTime, updatePosition=$updatePosition, bufferedPosition=$bufferedPosition, duration=$duration, currentIndex=$currentIndex}";
+}
+
+bool _listEquals<T>(List<T> a, List<T> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
 }
 
 /// Enumerates the different processing states of a player.
@@ -2247,11 +2323,26 @@ class DarwinLoadControl {
   /// second.
   final double? preferredPeakBitRate;
 
+  /// (iOS/macOS) The total duration of upcoming items for which asset metadata
+  /// (duration, tracks, playability) is proactively loaded via
+  /// `AVAsset.loadValuesAsynchronously`.
+  ///
+  /// At least 1 item ahead of the current item is always preloaded regardless
+  /// of this value. Additional items are preloaded until the sum of their
+  /// durations meets or exceeds [preloadBufferDuration]. Loading stops at a
+  /// hard cap of 20 items to guard against indefinite-duration streams.
+  ///
+  /// Only has effect when [AudioPlayer]'s useLazyPreparation is true (the
+  /// default). Particularly useful when playlist items are short, giving future
+  /// items more time to have their metadata loaded before they are needed.
+  final Duration? preloadBufferDuration;
+
   const DarwinLoadControl({
     this.automaticallyWaitsToMinimizeStalling = true,
     this.preferredForwardBufferDuration,
     this.canUseNetworkResourcesForLiveStreamingWhilePaused = false,
     this.preferredPeakBitRate,
+    this.preloadBufferDuration,
   });
 
   DarwinLoadControlMessage _toMessage() => DarwinLoadControlMessage(
@@ -2261,6 +2352,7 @@ class DarwinLoadControl {
         canUseNetworkResourcesForLiveStreamingWhilePaused:
             canUseNetworkResourcesForLiveStreamingWhilePaused,
         preferredPeakBitRate: preferredPeakBitRate,
+        preloadBufferDuration: preloadBufferDuration,
       );
 }
 

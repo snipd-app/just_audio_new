@@ -1,0 +1,333 @@
+# =============================================================================
+# Flowchart: preload_buffer_duration — full load / play / preload / retry flow
+#
+# Shows the complete lifecycle of an AudioPlayer playlist session:
+#   1. load()  →  enqueueFrom  →  startPreloadChain
+#   2. Preload chain (_enqueueAndLoadFromInvPos): async metadata accumulation
+#   3. KVO: playerItem.status  →  ReadyToPlay / Failed handling + retry
+#   4. Item finishes (didPlayToEndTime)  →  advance index
+#   5. KVO: currentItem changed  →  re-enqueue or continue preload chain
+#
+# ⚡ = error sent to Flutter (FlutterError on eventChannel, loadResult, or both)
+# =============================================================================
+
+direction: down
+
+# ─── ENTRY ──────────────────────────────────────────────────────────────────
+
+load_start: "load(playlist, initialIndex)" {shape: oval}
+
+load_already: "Already loading?\n_processingState == psLoading?" {shape: diamond}
+
+abort_conn: "⚡ abortExistingConnection(switchToIdle: NO)\n──────────────────\nsendError(ERROR_ABORT, \"Connection aborted\")\n  → FlutterError sent to _eventChannel\n  → errorCode/errorMessage set\n  → broadcastPlaybackEvent()" {shape: rectangle; style.fill: "#FFE0E0"}
+
+build: "buildSequence · addItemObservers (all items)\n_retryGeneration++\n[_retryCountPerSourceId removeAllObjects]\n_loadedDurationsPerItem = [–1, …]\n_processingState = Loading" {shape: rectangle}
+
+load_start -> load_already
+load_already -> abort_conn: "yes"
+load_already -> build: "no"
+abort_conn -> build
+
+build -> enqueue_from
+
+
+# ─── enqueueFrom(index) ──────────────────────────────────────────────────────
+
+enqueue_from: "enqueueFrom(index)\n──────────────────" {shape: rectangle}
+
+ef_fp: "First pass — scan _player.items:\n  oldItem = _player.currentItem\n  newItem = _indexedAudioSources[index].playerItem\n  for each item in queue:\n    if item == newItem  →  existingItem = item  (keep)\n    elif item == oldItem  →  keep temporarily\n    else  →  removeItem(item)" {shape: rectangle}
+
+ef_sp: "Second pass:\n  if oldItem ≠ newItem  →  removeItem(oldItem)" {shape: rectangle}
+
+ef_regen_loop: "Regen — iterate _order from index:\n  if si.playerItem == existingItem  →  skip\n  elif si.lazyLoading AND _player.items.count ≥ TREADMILL_SIZE\n    →  _enqueuedAll = NO  ·  break\n  else  →  insertItem(si.playerItem)\n  if loopMode == loopOne  →  break after first insert\n  (loop ends normally  →  _enqueuedAll = YES)" {shape: rectangle}
+
+ef_loopmode: "loopMode?" {shape: diamond}
+
+ef_loop_one: "loopMode = loopOne:\n  preparePlayerItem2 if needed\n  addItemObservers(playerItem2)\n  insertItem(playerItem2)" {shape: rectangle}
+
+ef_loop_all: "loopMode = loopAll AND _enqueuedAll:\n  preparePlayerItem2 for _order[0]\n  addItemObservers(playerItem2)\n  insertItem(playerItem2)" {shape: rectangle}
+
+ef_done: "updateEndAction()\nstartPreloadChain()" {shape: rectangle}
+
+enqueue_from -> ef_fp -> ef_sp -> ef_regen_loop -> ef_loopmode
+ef_loopmode -> ef_loop_one: "loopOne"
+ef_loopmode -> ef_loop_all: "loopAll AND\n_enqueuedAll"
+ef_loopmode -> ef_done: "none / not applicable"
+ef_loop_one -> ef_done
+ef_loop_all -> ef_done
+
+
+# ─── startPreloadChain ───────────────────────────────────────────────────────
+
+spc: "startPreloadChain()\n  guard: _preloadBufferDurationUs > 0\n         AND _useLazyPreparation\n         AND _order, _orderInv, sources valid\n  _preloadGeneration++\n  generation = _preloadGeneration\n  invPos = _orderInv[_index] + 1\n  (first item after current in play order)" {shape: rectangle}
+
+ef_done -> spc -> elf_entry
+
+
+# ─── _enqueueAndLoadFromInvPos (recursive) ───────────────────────────────────
+
+elf_entry: "_enqueueAndLoadFromInvPos(\n  invPos, accum=0, minRemaining=1,\n  generation, itemsLoaded=0)" {shape: rectangle}
+
+elf_guard: "invPos ≥ order.count\nOR itemsLoaded ≥ kMaxEnqueueItems (20)\nOR sourceIndex ≥ indexedAudioSources.count\nOR playerItem is nil\nOR asset is nil?" {shape: diamond}
+
+elf_stop_guard: "◉  STOP" {shape: oval}
+
+elf_inq: "playerItem already in\n_player.items?" {shape: diamond}
+
+elf_insert: "insertItem(playerItem)\ninto AVQueuePlayer" {shape: rectangle}
+
+elf_load: "asset.loadValuesAsynchronously(\n  [\"duration\", \"playable\"])\n→ completion dispatched to main queue" {shape: rectangle}
+
+elf_cb: "Async callback fires\n(on main queue)" {shape: rectangle}
+
+elf_gen_check: "generation ==\n_preloadGeneration?" {shape: diamond}
+
+elf_stale: "◉  DROP  (stale — newer\npreload cycle started)" {shape: oval}
+
+elf_order_check: "_order gone OR\ninvPos out of range?" {shape: diamond}
+
+elf_cancelled: "◉  DROP  (order invalidated\nafter async load)" {shape: oval}
+
+elf_dur: "Extract duration:\n  prefer source.duration (respects clipping)\n  fallback to asset.duration\n  if valid & finite:\n    _loadedDurationsPerItem[si] = durUs\nupdateBufferedPositionsPerItem()\n(may broadcastPlaybackEvent)" {shape: rectangle}
+
+elf_accum: "newAccum = accum + itemDurationUs" {shape: rectangle}
+
+elf_more: "needsMore?\n  (minRemaining – 1 > 0)\n  OR (_preloadBufferDurationUs > 0\n      AND newAccum < _preloadBufferDurationUs)" {shape: diamond}
+
+elf_stop_full: "◉  STOP  (buffer satisfied)" {shape: oval}
+
+elf_recurse: "Recurse:\n_enqueueAndLoadFromInvPos(\n  invPos+1, newAccum,\n  MAX(0, minRemaining–1),\n  generation, itemsLoaded+1)" {shape: rectangle}
+
+elf_entry -> elf_guard
+elf_guard -> elf_stop_guard: "yes"
+elf_guard -> elf_inq: "no"
+elf_inq -> elf_insert: "not in queue"
+elf_inq -> elf_load: "already in queue\n(skip insert)"
+elf_insert -> elf_load
+elf_load -> elf_cb -> elf_gen_check
+elf_gen_check -> elf_stale: "no"
+elf_gen_check -> elf_order_check: "yes"
+elf_order_check -> elf_cancelled: "yes"
+elf_order_check -> elf_dur: "no"
+elf_dur -> elf_accum -> elf_more
+elf_more -> elf_stop_full: "no  (enough buffered)"
+elf_more -> elf_recurse: "yes"
+elf_recurse -> elf_entry: "tail-recurse"
+
+
+# ─── KVO: playerItem.status changed ─────────────────────────────────────────
+
+kvo_status: "⬛  KVO: playerItem.status changed" {shape: rectangle}
+
+s_update_dur: "If ReadyToPlay AND _loadedDurationsPerItem:\n  update _loadedDurationsPerItem[itemIndex]\n  with source.duration (if valid/finite)" {shape: rectangle}
+
+s_is_current: "playerItem ==\n_player.currentItem?" {shape: diamond}
+
+
+# — Non-current, ReadyToPlay —
+
+nc_rtp: "Non-current · ReadyToPlay:\n  _retryCountPerSourceId[sourceId] removed\n  (item recovered — reset retry state)\n  updateEndAction()" {shape: rectangle}
+
+# — Current item, ReadyToPlay —
+
+c_rtp: "Current · ReadyToPlay:\n  updateBufferingState()\n  broadcastPlaybackEvent()\n  if _loadResult pending:\n    ⚡ loadResult({duration: dur})\n    _processingState = Ready" {shape: rectangle}
+
+# — Current item, Failed —
+
+c_fail: "⚡ Current · Failed:\n  pause()\n  _errorCode = item.error.code\n  _errorMessage = item.error.localizedDescription\n  broadcastPlaybackEvent()\n    → event includes errorCode + errorMessage\n  if _loadResult pending:\n    ⚡ _loadResult(FlutterError)\n    _loadResult = nil" {shape: rectangle; style.fill: "#FFE0E0"}
+
+err_state: "◉  ERROR STATE\n(errorCode/errorMessage surfaced to Flutter\nvia broadcastPlaybackEvent + loadResult)" {shape: oval; style.fill: "#FFE0E0"}
+
+# — Non-current, Failed → retry path —
+
+nc_fail: "Non-current · Failed:\nhandleNonCurrentItemFailed(playerItem)" {shape: rectangle}
+
+ncf_remove: "removeItem(playerItem)\nremoveItemObservers(playerItem)\n(always done first, even if index invalid)" {shape: rectangle}
+
+ncf_valid: "itemIndex valid AND\nsource still at index?" {shape: diamond}
+
+ncf_drop: "◉  DROP  (source gone\nor index out of range)" {shape: oval}
+
+ncf_is2: "playerItem ==\nsource.playerItem2?" {shape: diamond}
+
+ncf_clear2: "clearPlayerItem2()\n(loop copy failed — no retry needed)" {shape: rectangle}
+
+ncf_is_uri: "Is UriAudioSource or\nClippingAudioSource?" {shape: diamond}
+
+ncf_no_retry: "◉  DROP  (non-URI type\nnot retried)" {shape: oval}
+
+ncf_sched: "scheduleRetryForSource(\n  source, uriSource,\n  itemIndex, savedEndTime, failedItem)" {shape: rectangle}
+
+ncf_end_action: "updateEndAction()" {shape: rectangle}
+
+sched_count: "retryCount[sourceId]++\nretryCount > kMaxRetryAttempts (10)?" {shape: diamond}
+
+sched_exhausted: "◉  GIVE UP\n(attempts exhausted — stays in\n_retryCountPerSourceId; error will\nsurface when item becomes next to play)" {shape: oval}
+
+sched_delay: "delay = kRetryDelaySeconds (1.0 s)\ncapturedGeneration = _retryGeneration\ndispatch_after(delay, main_queue, retryBlock)" {shape: rectangle}
+
+retry_fires: "⬛  Retry block fires\n(on main queue, after 1.0 s)" {shape: rectangle}
+
+r_gen: "_retryGeneration\n== capturedGeneration?" {shape: diamond}
+
+r_cancelled1: "◉  CANCELLED\n(player reset / reloaded)" {shape: oval}
+
+r_src: "Source still at\nexpected itemIndex?" {shape: diamond}
+
+r_cancelled2: "◉  CANCELLED\n(source removed from playlist)" {shape: oval}
+
+r_recreate: "recreatePlayerItem()\nuriSource.playerItem.audioSource = source\nif savedEndTime valid:\n  playerItem.forwardPlaybackEndTime = savedEndTime\naddItemObservers(source.playerItem)\nenqueueFrom(_index)" {shape: rectangle}
+
+r_inq: "source.playerItem in\n_player.items?" {shape: diamond}
+
+r_cleanup: "removeItemObservers()\n(item fell behind _index — cleaned up)" {shape: rectangle}
+
+r_await: "Await next\nKVO status event" {shape: oval}
+
+kvo_status -> s_update_dur -> s_is_current
+s_is_current -> nc_rtp: "no, ReadyToPlay"
+s_is_current -> nc_fail: "no, Failed"
+s_is_current -> c_rtp: "yes, ReadyToPlay"
+s_is_current -> c_fail: "yes, Failed"
+c_fail -> err_state
+nc_fail -> ncf_remove -> ncf_valid
+ncf_valid -> ncf_drop: "no"
+ncf_valid -> ncf_is2: "yes"
+ncf_is2 -> ncf_clear2: "yes"
+ncf_is2 -> ncf_is_uri: "no"
+ncf_is_uri -> ncf_no_retry: "no"
+ncf_is_uri -> ncf_sched: "yes"
+ncf_clear2 -> ncf_end_action
+ncf_no_retry -> ncf_end_action
+ncf_sched -> sched_count
+sched_count -> sched_exhausted: "yes (> 10)"
+sched_count -> sched_delay: "no"
+sched_exhausted -> ncf_end_action
+sched_delay -> ncf_end_action: "(schedule is async;\nupdateEndAction runs\nimmediately)"
+retry_fires -> r_gen
+r_gen -> r_cancelled1: "no"
+r_gen -> r_src: "yes"
+r_src -> r_cancelled2: "no"
+r_src -> r_recreate: "yes"
+r_recreate -> r_inq
+r_inq -> r_cleanup: "no (behind _index)"
+r_inq -> r_await: "yes (enqueued)"
+r_await -> kvo_status: "on next status KVO\n(may loop back to Failed\nfor another retry)"
+
+
+# ─── Item finishes → advance ─────────────────────────────────────────────────
+
+play_to_end: "⬛  AVPlayerItem.didPlayToEndTime\n(NSNotification from AVQP)" {shape: rectangle}
+
+on_complete_mode: "loopMode?" {shape: diamond}
+
+oc_loop_one: "loopMode = loopOne:\n  seek to zero\n  _justAdvanced = YES" {shape: rectangle}
+
+oc_next: "Compute nextIndex:\n  loopAll:  _order[(invPos+1) % count]\n  loopOff:  _order[invPos+1] if exists\n  else:     no next (hasNext = NO)" {shape: rectangle}
+
+oc_has_next: "hasNext?" {shape: diamond}
+
+oc_next_retry: "nextItem in\n_retryCountPerSourceId?" {shape: diamond}
+
+oc_next_err: "⚡ Next item is retrying:\n  _playing = NO\n  pause()\n  _index = nextIndex\n  updatePosition()\n  sendErrorForItem(nextItem.playerItem)" {shape: rectangle; style.fill: "#FFE0E0"}
+
+oc_advance: "seek(endedSource, zero)\n_index = nextIndex\nif loopOff:  updateEndAction()\nbroadcastPlaybackEvent()\n_justAdvanced = YES" {shape: rectangle}
+
+oc_last: "◉  processingState = Completed\nbroadcastPlaybackEvent()" {shape: oval}
+
+play_to_end -> on_complete_mode
+on_complete_mode -> oc_loop_one: "loopOne"
+on_complete_mode -> oc_next: "loopAll / loopOff"
+oc_loop_one -> kvo_ci_wait: "await KVO currentItem"
+oc_next -> oc_has_next
+oc_has_next -> oc_last: "no"
+oc_has_next -> oc_next_retry: "yes"
+oc_next_retry -> oc_next_err: "yes"
+oc_next_retry -> oc_advance: "no"
+oc_next_err -> send_err_detail: "→ sendErrorForItem"
+oc_advance -> kvo_ci_wait: "await KVO currentItem"
+
+
+# ─── sendErrorForItem / sendError (helper) ───────────────────────────────────
+
+send_err_detail: "⚡ sendErrorForItem(playerItem)\n──────────────────\n1. FlutterError → _eventChannel.sendEvent()\n   (immediate error event to Flutter)\n2. _errorCode = item.error.code\n3. _errorMessage = item.error.localizedDescription\n4. _processingState = psIdle\n5. broadcastPlaybackEvent()\n   (event with errorCode/errorMessage fields)\n6. if _loadResult && item == currentItem:\n   _loadResult(FlutterError)\n7. [_player removeAllItems]" {shape: rectangle; style.fill: "#FFE0E0"}
+
+send_err_stop: "◉  ERROR + IDLE\n(all items removed, player stopped)" {shape: oval; style.fill: "#FFE0E0"}
+
+send_err_detail -> send_err_stop
+
+
+# ─── KVO: currentItem changed ────────────────────────────────────────────────
+
+kvo_ci_wait: "(awaiting KVO: currentItem)" {shape: rectangle}
+
+kvo_ci: "⬛  KVO: currentItem changed\n(new item now playing)" {shape: rectangle}
+
+ci_failed: "New item.status == Failed\n(AVQP skipped an error item)?" {shape: diamond}
+
+ci_skip_err: "⚡ sendErrorForItem(playerItem)\n(new item is already failed)" {shape: rectangle; style.fill: "#FFE0E0"}
+
+ci_index_match: "_index matches\nexpected item?" {shape: diamond}
+
+ci_retry_skipped: "Walk play order from _index+1\nto expectedIndex: any item in\n_retryCountPerSourceId?" {shape: diamond}
+
+ci_retry_err: "⚡ Retrying item was skipped:\n  _playing = NO\n  pause()\n  _index = skipped item index\n  updatePosition()\n  sendErrorForItem(skippedItem.playerItem)" {shape: rectangle; style.fill: "#FFE0E0"}
+
+ci_fix_index: "Adjust _index to match\nactual currentItem\nupdateEndAction()\nbroadcastPlaybackEvent()" {shape: rectangle}
+
+ci_ja: "_justAdvanced?" {shape: diamond}
+
+ci_lm1: "loopMode == loopOne?" {shape: diamond}
+
+ci_flip1: "source.flip()\nenqueueFrom(_index)" {shape: rectangle}
+
+ci_lma: "loopMode == loopAll?" {shape: diamond}
+
+ci_lma_boundary: "At loop boundary?\n(_index==order[0] AND\nplayerItem==playerItem2)" {shape: diamond}
+
+ci_flip2: "source.flip()\nenqueueFrom(_index)" {shape: rectangle}
+
+ci_ea1: "_enqueuedAll?" {shape: diamond}
+
+ci_ef1: "enqueueFrom(_index)\n(continue filling treadmill)" {shape: rectangle}
+
+ci_spc1: "updateEndAction()\nstartPreloadChain()\n(all enqueued — extend preload)" {shape: rectangle}
+
+ci_ea2: "_enqueuedAll?" {shape: diamond}
+
+ci_ef2: "enqueueFrom(_index)" {shape: rectangle}
+
+ci_spc2: "startPreloadChain()" {shape: rectangle}
+
+ci_clear: "_justAdvanced = NO" {shape: rectangle}
+
+kvo_ci_wait -> kvo_ci
+kvo_ci -> ci_failed
+ci_failed -> ci_skip_err: "yes"
+ci_skip_err -> send_err_detail: "→ sendErrorForItem"
+ci_failed -> ci_index_match: "no"
+ci_index_match -> ci_retry_skipped: "no (AVQP skipped item)"
+ci_retry_skipped -> ci_retry_err: "yes (retrying item found)"
+ci_retry_err -> send_err_detail: "→ sendErrorForItem"
+ci_retry_skipped -> ci_fix_index: "no"
+ci_index_match -> ci_ja: "yes"
+ci_fix_index -> ci_ja
+ci_ja -> ci_lm1: "YES"
+ci_ja -> play_to_end: "NO  (seek / load\n→ ignore for enqueue)"
+ci_lm1 -> ci_flip1: "yes"
+ci_lm1 -> ci_lma: "no"
+ci_lma -> ci_lma_boundary: "yes"
+ci_lma -> ci_ea2: "no"
+ci_lma_boundary -> ci_flip2: "yes\n(wrap-around)"
+ci_lma_boundary -> ci_ea1: "no"
+ci_ea1 -> ci_ef1: "NO"
+ci_ea1 -> ci_spc1: "YES"
+ci_ea2 -> ci_ef2: "NO"
+ci_ea2 -> ci_spc2: "YES"
+ci_flip1 -> ci_clear
+ci_flip2 -> ci_clear
+ci_ef1 -> ci_clear
+ci_spc1 -> ci_clear
+ci_ef2 -> ci_clear
+ci_spc2 -> ci_clear
+ci_clear -> play_to_end: "await next item end"
