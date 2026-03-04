@@ -60,6 +60,7 @@ static const BOOL DEBUG_LOG = NO;
     NSString *_errorMessage;
     NSArray<NSNumber *> *_bufferedPositionsPerItem;
     NSMutableArray<NSNumber *> *_loadedDurationsPerItem;
+    NSMutableArray<id> *_errorsPerItem;
 }
 
 - (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar playerId:(NSString*)idParam loadConfiguration:(NSDictionary *)loadConfiguration useLazyPreparation:(BOOL)useLazyPreparation {
@@ -225,11 +226,14 @@ static const BOOL DEBUG_LOG = NO;
     }
     // Index the new audio sources.
     NSArray<NSNumber *> *oldDurations = _loadedDurationsPerItem;
+    NSArray<id> *oldErrors = _errorsPerItem;
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
     _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    _errorsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
     for (int i = 0; i < (int)_indexedAudioSources.count; i++) {
         [_loadedDurationsPerItem addObject:(i < (int)oldDurations.count ? oldDurations[i] : @(-1LL))];
+        [_errorsPerItem addObject:(oldErrors && i < (int)oldErrors.count ? oldErrors[i] : [NSNull null])];
     }
     for (int i = 0; i < [_indexedAudioSources count]; i++) {
         IndexedAudioSource *audioSource = _indexedAudioSources[i];
@@ -269,9 +273,11 @@ static const BOOL DEBUG_LOG = NO;
     // Re-index the remaining audio sources.
     NSArray<IndexedAudioSource *> *oldIndexedAudioSources = _indexedAudioSources;
     NSArray<NSNumber *> *oldDurations = _loadedDurationsPerItem;
+    NSArray<id> *oldErrors = _errorsPerItem;
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
     _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    _errorsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
     for (int i = 0, j = 0; i < _indexedAudioSources.count; i++, j++) {
         IndexedAudioSource *audioSource = _indexedAudioSources[i];
         while (audioSource != oldIndexedAudioSources[j]) {
@@ -287,6 +293,7 @@ static const BOOL DEBUG_LOG = NO;
             j++;
         }
         [_loadedDurationsPerItem addObject:(j < (int)oldDurations.count ? oldDurations[j] : @(-1LL))];
+        [_errorsPerItem addObject:(oldErrors && j < (int)oldErrors.count ? oldErrors[j] : [NSNull null])];
     }
     [self updateOrder];
     if (_index >= _indexedAudioSources.count) _index = (int)_indexedAudioSources.count - 1;
@@ -310,6 +317,7 @@ static const BOOL DEBUG_LOG = NO;
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
     _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    _errorsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
     for (int i = 0; i < (int)_indexedAudioSources.count; i++) {
         CMTime dur = _indexedAudioSources[i].duration;
         if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur)) {
@@ -317,6 +325,7 @@ static const BOOL DEBUG_LOG = NO;
         } else {
             [_loadedDurationsPerItem addObject:@(-1LL)];
         }
+        [_errorsPerItem addObject:[NSNull null]];
     }
     [self updateOrder];
     [self enqueueFrom:[self indexForItem:(IndexedPlayerItem *)_player.currentItem]];
@@ -422,6 +431,7 @@ static const BOOL DEBUG_LOG = NO;
             @"errorMessage": _errorMessage,
             @"bufferedPositionPerIndex": _bufferedPositionsPerItem ?: @[],
             @"loadedDurationPerIndex": [self computeLoadedDurationsPerItem],
+            @"errorsPerItem": _errorsPerItem ?: @[],
     }];
 }
 
@@ -822,6 +832,7 @@ static const BOOL DEBUG_LOG = NO;
     _errorMessage = (NSString *)[NSNull null];
     _bufferedPositionsPerItem = nil;
     _loadedDurationsPerItem = nil;
+    _errorsPerItem = nil;
     // Remove previous observers
     if (_indexedAudioSources) {
         for (int i = 0; i < [_indexedAudioSources count]; i++) {
@@ -866,8 +877,10 @@ static const BOOL DEBUG_LOG = NO;
     _indexedAudioSources = [[NSMutableArray alloc] init];
     [_audioSource buildSequence:_indexedAudioSources treeIndex:0];
     _loadedDurationsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
+    _errorsPerItem = [[NSMutableArray alloc] initWithCapacity:_indexedAudioSources.count];
     for (int i = 0; i < [_indexedAudioSources count]; i++) {
         [_loadedDurationsPerItem addObject:@(-1LL)];
+        [_errorsPerItem addObject:[NSNull null]];
     }
     for (int i = 0; i < [_indexedAudioSources count]; i++) {
         IndexedAudioSource *source = _indexedAudioSources[i];
@@ -1026,6 +1039,15 @@ static const BOOL DEBUG_LOG = NO;
             status = statusNumber.intValue;
         }
         [playerItem.audioSource onStatusChanged:status];
+        if (status == AVPlayerItemStatusFailed && _errorsPerItem) {
+            int itemIndex = [self indexForItem:playerItem];
+            if (itemIndex >= 0 && itemIndex < (int)_errorsPerItem.count && playerItem.error) {
+                _errorsPerItem[itemIndex] = @{
+                    @"code": @((int)playerItem.error.code),
+                    @"message": playerItem.error.localizedDescription ?: @"Unknown error",
+                };
+            }
+        }
         if (status == AVPlayerItemStatusReadyToPlay && _loadedDurationsPerItem) {
             int itemIndex = [self indexForItem:playerItem];
             if (itemIndex >= 0 && itemIndex < (int)_loadedDurationsPerItem.count) {
@@ -1287,6 +1309,12 @@ static const BOOL DEBUG_LOG = NO;
 
     if (DEBUG_LOG) NSLog(@"non-current item [%d] failed (error: %@) — will pause before it",
                          itemIndex, playerItem.error.localizedDescription);
+    if (_errorsPerItem && itemIndex >= 0 && itemIndex < (int)_errorsPerItem.count && playerItem.error) {
+        _errorsPerItem[itemIndex] = @{
+            @"code": @((int)playerItem.error.code),
+            @"message": playerItem.error.localizedDescription ?: @"Unknown error",
+        };
+    }
     [self updateEndAction];
 }
 
@@ -1709,6 +1737,7 @@ static const BOOL DEBUG_LOG = NO;
     _audioSource = nil;
     _bufferedPositionsPerItem = nil;
     _loadedDurationsPerItem = nil;
+    _errorsPerItem = nil;
     if (_player) {
         [_player removeObserver:self forKeyPath:@"currentItem"];
         if (@available(macOS 10.12, iOS 10.0, *)) {

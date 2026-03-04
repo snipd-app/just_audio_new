@@ -41,6 +41,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   int _failCount = 5;
   List<Duration> _bufferedPerIndex = const [];
   List<Duration?> _durationPerIndex = const [];
+  List<PlayerItemError?> _errorsPerIndex = const [];
   Map<int, int> _playDelayPerIndex = {};
   DateTime? _indexChangeTime;
   int? _pendingDelayIndex;
@@ -63,9 +64,10 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             duration: const Duration(milliseconds: 200),
             tag: AudioMetadata(
                 album: "Silence 1", title: "Silence 1", artwork: "")),
-        AudioSource.uri(
-          Uri.parse(
+        FailableUriAudioSource(
+          uri: Uri.parse(
               "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/00__e0b0794e75a6494a89cc548d976f6682.mp3"),
+          failCount: _failCount,
           tag: AudioMetadata(
             album: "AI DJ - Intro",
             title: "AI DJ - Intro",
@@ -76,10 +78,9 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             duration: const Duration(milliseconds: 1000),
             tag: AudioMetadata(
                 album: "Silence 2", title: "Silence 2", artwork: "")),
-        FailableUriAudioSource(
-          uri: Uri.parse(
+        AudioSource.uri(
+          Uri.parse(
               "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/01__11dabf89a28b435288bafe86080d1a95.mp3"),
-          failCount: _failCount,
           tag: AudioMetadata(
             album: "AI DJ - Highlight 1 - Intro (Failable)",
             title: "AI DJ - Highlight 1 - Intro (Failable)",
@@ -175,6 +176,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       _player = _createPlayer();
       _bufferedPerIndex = const [];
       _durationPerIndex = const [];
+      _errorsPerIndex = const [];
       _playDelayPerIndex = {};
       _lastError = null;
     });
@@ -208,7 +210,9 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       final changeTime = _indexChangeTime;
       if (pending == null ||
           changeTime == null ||
-          _player.currentIndex != pending) return;
+          _player.currentIndex != pending) {
+        return;
+      }
 
       if (_pendingBaselinePosition == null) {
         _pendingBaselinePosition = position;
@@ -249,6 +253,10 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     _player.loadedDurationPerIndexStream.listen((list) {
       setState(() => _durationPerIndex = list);
     });
+
+    _player.errorsPerItemStream.listen((list) {
+      setState(() => _errorsPerIndex = list);
+    });
   }
 
   void _subscribeToAttemptsNotifiers(List<AudioSource> playlist) {
@@ -280,6 +288,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     setState(() {
       _bufferedPerIndex = const [];
       _durationPerIndex = const [];
+      _errorsPerIndex = const [];
       _playDelayPerIndex = {};
     });
     _pendingDelayIndex = null;
@@ -297,11 +306,23 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   Widget? _buildItemSubtitle(int i, AudioSource source) {
     final buf = i < _bufferedPerIndex.length ? _bufferedPerIndex[i] : null;
     final dur = i < _durationPerIndex.length ? _durationPerIndex[i] : null;
+    final itemError = i < _errorsPerIndex.length ? _errorsPerIndex[i] : null;
 
     final delay = _playDelayPerIndex[i];
     final retries = source is FailableUriAudioSource ? source.attempts : null;
 
-    if (buf == null && delay == null && retries == null) return null;
+    if (buf == null && delay == null && retries == null && itemError == null) {
+      return null;
+    }
+
+    if (itemError != null) {
+      return Text(
+        'Error ${itemError.code}: ${itemError.message}',
+        style: TextStyle(fontSize: 11, color: Colors.red.shade700),
+        overflow: TextOverflow.ellipsis,
+        maxLines: 2,
+      );
+    }
 
     final retryWidget = retries != null
         ? Text(

@@ -141,6 +141,8 @@ class AudioPlayer {
       BehaviorSubject<List<Duration>>.seeded(const []);
   final _loadedDurationPerIndexSubject =
       BehaviorSubject<List<Duration?>>.seeded(const []);
+  final _errorsPerItemSubject =
+      BehaviorSubject<List<PlayerItemError?>>.seeded(const []);
   final _icyMetadataSubject = BehaviorSubject<IcyMetadata?>.seeded(null);
   final _androidAudioSessionIdSubject = BehaviorSubject<int?>.seeded(null);
   final _errorSubject = PublishSubject<PlayerException>();
@@ -291,6 +293,9 @@ class AudioPlayer {
         .distinct());
     _loadedDurationPerIndexSubject.addStream(playbackEventStream
         .map((event) => event.loadedDurationPerIndex)
+        .distinct(_listEquals));
+    _errorsPerItemSubject.addStream(playbackEventStream
+        .map((event) => event.errorsPerItem)
         .distinct(_listEquals));
     _icyMetadataSubject.addStream(
         playbackEventStream.map((event) => event.icyMetadata).distinct());
@@ -564,6 +569,19 @@ class AudioPlayer {
   /// is `null` until the duration metadata for that source has been loaded.
   Stream<List<Duration?>> get loadedDurationPerIndexStream =>
       _loadedDurationPerIndexSubject.stream.distinct(_listEquals);
+
+  /// The error for each indexed audio source in the current playlist, or
+  /// `null` if no error has occurred for that source.
+  List<PlayerItemError?> get errorsPerItem =>
+      _errorsPerItemSubject.nvalue ?? const [];
+
+  /// A stream of per-item errors.
+  ///
+  /// Each emission is a list with one entry per indexed audio source. An entry
+  /// is `null` when no error has occurred for that source, or a
+  /// [PlayerItemError] once the item has failed.
+  Stream<List<PlayerItemError?>> get errorsPerItemStream =>
+      _errorsPerItemSubject.stream.distinct(_listEquals);
 
   /// The latest ICY metadata received through the audio source, or `null` if no
   /// metadata is available.
@@ -1491,6 +1509,7 @@ class AudioPlayer {
       await _bufferedPositionSubject.close();
       await _bufferedPositionPerIndexSubject.close();
       await _loadedDurationPerIndexSubject.close();
+      await _errorsPerItemSubject.close();
       await _icyMetadataSubject.close();
       await _androidAudioSessionIdSubject.close();
       await _errorSubject.close();
@@ -1627,6 +1646,11 @@ class AudioPlayer {
           errorMessage: message.errorMessage,
           bufferedPositionPerIndex: message.bufferedPositionPerIndex,
           loadedDurationPerIndex: message.loadedDurationPerIndex,
+          errorsPerItem: message.errorsPerItem
+              .map((e) => e == null
+                  ? null
+                  : PlayerItemError(code: e.code, message: e.message))
+              .toList(),
         );
         _loadFuture = Future.value(newPlaybackEvent.duration);
         if (newPlaybackEvent == playbackEvent) {
@@ -1932,6 +1956,30 @@ class PlayerEvent {
   String toString() => "{playbackEvent=$playbackEvent, playing=$playing}";
 }
 
+/// Represents an error for an individual audio source in a playlist.
+class PlayerItemError {
+  /// The platform-specific error code.
+  final int code;
+
+  /// The human-readable error message.
+  final String message;
+
+  PlayerItemError({required this.code, required this.message});
+
+  @override
+  bool operator ==(Object other) =>
+      other.runtimeType == runtimeType &&
+      other is PlayerItemError &&
+      code == other.code &&
+      message == other.message;
+
+  @override
+  int get hashCode => Object.hash(code, message);
+
+  @override
+  String toString() => '{code=$code, message=$message}';
+}
+
 /// Encapsulates the playback state and current position of the player.
 class PlaybackEvent {
   /// The current processing state.
@@ -1983,6 +2031,10 @@ class PlaybackEvent {
   /// An entry is `null` when the duration of that source is not yet known.
   final List<Duration?> loadedDurationPerIndex;
 
+  /// The error for each indexed audio source in the playlist, or `null` if
+  /// no error has occurred for that source.
+  final List<PlayerItemError?> errorsPerItem;
+
   PlaybackEvent({
     this.processingState = ProcessingState.idle,
     DateTime? updateTime,
@@ -1996,6 +2048,7 @@ class PlaybackEvent {
     this.errorMessage,
     this.bufferedPositionPerIndex = const [],
     this.loadedDurationPerIndex = const [],
+    this.errorsPerItem = const [],
   }) : updateTime = updateTime ?? DateTime.now();
 
   /// Returns a copy of this event with given properties replaced.
@@ -2012,6 +2065,7 @@ class PlaybackEvent {
     String? errorMessage,
     List<Duration>? bufferedPositionPerIndex,
     List<Duration?>? loadedDurationPerIndex,
+    List<PlayerItemError?>? errorsPerItem,
   }) =>
       PlaybackEvent(
         processingState: processingState ?? this.processingState,
@@ -2029,6 +2083,7 @@ class PlaybackEvent {
             bufferedPositionPerIndex ?? this.bufferedPositionPerIndex,
         loadedDurationPerIndex:
             loadedDurationPerIndex ?? this.loadedDurationPerIndex,
+        errorsPerItem: errorsPerItem ?? this.errorsPerItem,
       );
 
   @override
@@ -2045,6 +2100,7 @@ class PlaybackEvent {
         errorMessage,
         ...bufferedPositionPerIndex,
         ...loadedDurationPerIndex,
+        ...errorsPerItem,
       ]);
 
   @override
@@ -2062,7 +2118,8 @@ class PlaybackEvent {
       errorCode == other.errorCode &&
       errorMessage == other.errorMessage &&
       _listEquals(bufferedPositionPerIndex, other.bufferedPositionPerIndex) &&
-      _listEquals(loadedDurationPerIndex, other.loadedDurationPerIndex);
+      _listEquals(loadedDurationPerIndex, other.loadedDurationPerIndex) &&
+      _listEquals(errorsPerItem, other.errorsPerItem);
 
   @override
   String toString() =>
