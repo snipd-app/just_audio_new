@@ -282,6 +282,22 @@ class PlayerDataMessage {
       );
 }
 
+/// Represents a per-item error communicated from the platform implementation.
+class PlayerItemErrorMessage {
+  final int code;
+  final String message;
+
+  PlayerItemErrorMessage({required this.code, required this.message});
+
+  static PlayerItemErrorMessage? fromMap(dynamic map) {
+    if (map == null || map is! Map) return null;
+    return PlayerItemErrorMessage(
+      code: map['code'] as int,
+      message: map['message'] as String,
+    );
+  }
+}
+
 /// A playback event communicated from the platform implementation to the
 /// Flutter plugin.
 class PlaybackEventMessage {
@@ -297,6 +313,7 @@ class PlaybackEventMessage {
   final String? errorMessage;
   final List<Duration> bufferedPositionPerIndex;
   final List<Duration?> loadedDurationPerIndex;
+  final List<PlayerItemErrorMessage?> errorsPerItem;
 
   PlaybackEventMessage({
     required this.processingState,
@@ -311,6 +328,7 @@ class PlaybackEventMessage {
     this.errorMessage,
     this.bufferedPositionPerIndex = const [],
     this.loadedDurationPerIndex = const [],
+    this.errorsPerItem = const [],
   });
 
   static PlaybackEventMessage fromMap(Map<dynamic, dynamic> map) =>
@@ -345,6 +363,10 @@ class PlaybackEventMessage {
                         : Duration(microseconds: e.toInt()))
                     .toList() ??
                 const [],
+        errorsPerItem: (map['errorsPerItem'] as List<dynamic>?)
+                ?.map((e) => PlayerItemErrorMessage.fromMap(e))
+                .toList() ??
+            const [],
       );
 }
 

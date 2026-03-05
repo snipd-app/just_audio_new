@@ -110,6 +110,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private Integer errorCode;
     private String errorMessage;
     private Integer currentIndex;
+    private List<Map<String, Object>> errorsPerItem = new ArrayList<>();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable bufferWatcher = new Runnable() {
         @Override
@@ -307,6 +308,10 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onTimelineChanged(Timeline timeline, int reason) {
+        // Keep errorsPerItem sized to match the timeline (handles nested concatenating mutations).
+        int newCount = timeline.getWindowCount();
+        while (errorsPerItem.size() < newCount) errorsPerItem.add(null);
+        while (errorsPerItem.size() > newCount) errorsPerItem.remove(errorsPerItem.size() - 1);
         if (updateCurrentIndex()) {
             broadcastImmediatePlaybackEvent();
         }
@@ -422,11 +427,21 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 Log.e(TAG, "default ExoPlaybackException: " + exoError.getUnexpectedException().getMessage());
             }
             // TODO: send both errorCode and type
+            recordItemError(currentIndex, exoError.type, exoError.getMessage());
             sendError(exoError.type, exoError.getMessage(), mapOf("index", currentIndex));
         } else {
             Log.e(TAG, "default PlaybackException: " + error.getMessage());
+            recordItemError(currentIndex, error.errorCode, error.getMessage());
             sendError(error.errorCode, error.getMessage(), mapOf("index", currentIndex));
         }
+    }
+
+    private void recordItemError(Integer index, int code, String message) {
+        if (index == null || index < 0 || index >= errorsPerItem.size()) return;
+        Map<String, Object> err = new HashMap<>();
+        err.put("code", code);
+        err.put("message", message != null ? message : "Unknown error");
+        errorsPerItem.set(index, err);
     }
 
     private void completeSeek() {
@@ -502,7 +517,12 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 break;
             case "concatenatingInsertAll":
                 if (((String)call.argument("id")).length() == 0) {
-                    player.addMediaSources(call.argument("index"), getAudioSources(call.argument("children"))); 
+                    int insertIdx = call.<Integer>argument("index");
+                    List<?> insertedChildren = call.argument("children");
+                    int insertCount = insertedChildren != null ? insertedChildren.size() : 0;
+                    int clampedInsertIdx = Math.min(insertIdx, errorsPerItem.size());
+                    for (int i = 0; i < insertCount; i++) errorsPerItem.add(clampedInsertIdx + i, null);
+                    player.addMediaSources(insertIdx, getAudioSources(call.argument("children")));
                     player.setShuffleOrder(decodeShuffleOrder(call.argument("shuffleOrder")));
                     result.success(new HashMap<String, Object>());
                 } else {
@@ -514,7 +534,12 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 break;
             case "concatenatingRemoveRange":
                 if (((String)call.argument("id")).length() == 0) {
-                    player.removeMediaItems(call.argument("startIndex"), call.argument("endIndex"));
+                    int removeStart = call.<Integer>argument("startIndex");
+                    int removeEnd = call.<Integer>argument("endIndex");
+                    for (int i = Math.min(removeEnd, errorsPerItem.size()) - 1; i >= Math.min(removeStart, errorsPerItem.size()); i--) {
+                        errorsPerItem.remove(i);
+                    }
+                    player.removeMediaItems(removeStart, removeEnd);
                     player.setShuffleOrder(decodeShuffleOrder(call.argument("shuffleOrder")));
                     result.success(new HashMap<String, Object>());
                 } else {
@@ -526,6 +551,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 break;
             case "concatenatingMove":
                 if (((String)call.argument("id")).length() == 0) {
+                    Collections.fill(errorsPerItem, null);
                     player.moveMediaItem(call.argument("currentIndex"), call.argument("newIndex"));
                     player.setShuffleOrder(decodeShuffleOrder(call.argument("shuffleOrder")));
                     result.success(new HashMap<String, Object>());
@@ -772,6 +798,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         processingState = ProcessingState.loading;
         errorCode = null;
         errorMessage = null;
+        errorsPerItem = new ArrayList<>(mediaSources.size());
+        for (int i = 0; i < mediaSources.size(); i++) errorsPerItem.add(null);
         enqueuePlaybackEvent();
         int windowIndex = initialIndex != null ? initialIndex : 0;
         player.setMediaSources(mediaSources, windowIndex, initialPosition);
@@ -941,6 +969,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         event.put("errorMessage", errorMessage);
         event.put("bufferedPositionPerIndex", computeBufferedPositionsPerIndex());
         event.put("loadedDurationPerIndex", computeLoadedDurationsPerIndex());
+        event.put("errorsPerItem", new ArrayList<>(errorsPerItem));
         return event;
     }
 

@@ -141,6 +141,8 @@ class AudioPlayer {
       BehaviorSubject<List<Duration>>.seeded(const []);
   final _loadedDurationPerIndexSubject =
       BehaviorSubject<List<Duration?>>.seeded(const []);
+  final _errorsPerItemSubject =
+      BehaviorSubject<List<PlayerItemError?>>.seeded(const []);
   final _icyMetadataSubject = BehaviorSubject<IcyMetadata?>.seeded(null);
   final _androidAudioSessionIdSubject = BehaviorSubject<int?>.seeded(null);
   final _errorSubject = PublishSubject<PlayerException>();
@@ -291,6 +293,9 @@ class AudioPlayer {
         .distinct());
     _loadedDurationPerIndexSubject.addStream(playbackEventStream
         .map((event) => event.loadedDurationPerIndex)
+        .distinct(_listEquals));
+    _errorsPerItemSubject.addStream(playbackEventStream
+        .map((event) => event.errorsPerItem)
         .distinct(_listEquals));
     _icyMetadataSubject.addStream(
         playbackEventStream.map((event) => event.icyMetadata).distinct());
@@ -564,6 +569,19 @@ class AudioPlayer {
   /// is `null` until the duration metadata for that source has been loaded.
   Stream<List<Duration?>> get loadedDurationPerIndexStream =>
       _loadedDurationPerIndexSubject.stream.distinct(_listEquals);
+
+  /// The error for each indexed audio source in the current playlist, or
+  /// `null` if no error has occurred for that source.
+  List<PlayerItemError?> get errorsPerItem =>
+      _errorsPerItemSubject.nvalue ?? const [];
+
+  /// A stream of per-item errors.
+  ///
+  /// Each emission is a list with one entry per indexed audio source. An entry
+  /// is `null` when no error has occurred for that source, or a
+  /// [PlayerItemError] once the item has failed.
+  Stream<List<PlayerItemError?>> get errorsPerItemStream =>
+      _errorsPerItemSubject.stream.distinct(_listEquals);
 
   /// The latest ICY metadata received through the audio source, or `null` if no
   /// metadata is available.
@@ -1142,6 +1160,12 @@ class AudioPlayer {
       final requireActive = _playlist.children.isNotEmpty;
       if (requireActive) {
         if (_active) {
+          // If the proxy died while we were paused, recover it first. This may
+          // also send a play request internally (reload path), but we always
+          // send one below too; the platform will ignore the duplicate.
+          if (_playlistNeedsProxy() && await _proxy._needsRecovery()) {
+            await _recoverProxy();
+          }
           // If the native platform is already active, send it a play request.
           // NOTE: If a load() request happens simultaneously, this may result
           // in two play requests being sent. The platform implementation should
@@ -1491,6 +1515,7 @@ class AudioPlayer {
       await _bufferedPositionSubject.close();
       await _bufferedPositionPerIndexSubject.close();
       await _loadedDurationPerIndexSubject.close();
+      await _errorsPerItemSubject.close();
       await _icyMetadataSubject.close();
       await _androidAudioSessionIdSubject.close();
       await _errorSubject.close();
@@ -1627,6 +1652,11 @@ class AudioPlayer {
           errorMessage: message.errorMessage,
           bufferedPositionPerIndex: message.bufferedPositionPerIndex,
           loadedDurationPerIndex: message.loadedDurationPerIndex,
+          errorsPerItem: message.errorsPerItem
+              .map((e) => e == null
+                  ? null
+                  : PlayerItemError(code: e.code, message: e.message))
+              .toList(),
         );
         _loadFuture = Future.value(newPlaybackEvent.duration);
         if (newPlaybackEvent == playbackEvent) {
@@ -1831,6 +1861,26 @@ class AudioPlayer {
     }
   }
 
+  /// Returns true if any audio source in the current playlist requires the
+  /// proxy (i.e. a [StreamAudioSource], or a [UriAudioSource] with headers /
+  /// user-agent when [_useProxyForRequestHeaders] is enabled).
+  bool _playlistNeedsProxy() {
+    if (kIsWeb) return false;
+    return _playlist.sequence.any((source) =>
+        source is StreamAudioSource ||
+        (source is UriAudioSource &&
+            _useProxyForRequestHeaders &&
+            source.uri.scheme != 'file' &&
+            (source.headers != null || _userAgent != null)));
+  }
+
+  /// Force-closes the proxy HTTP server. For testing proxy auto-recovery only.
+  Future<void> killProxyForTesting() async {
+    if (_proxy._running) {
+      await _proxy._server.close(force: true);
+    }
+  }
+
   /// Clears the plugin's internal asset cache directory. Call this when the
   /// app's assets have changed to force assets to be re-fetched from the asset
   /// bundle.
@@ -1838,6 +1888,61 @@ class AudioPlayer {
     if (kIsWeb) return;
     await for (var file in (await _getCacheDir()).list()) {
       await file.delete(recursive: true);
+    }
+  }
+
+  /// Called when the proxy HTTP server dies unexpectedly (e.g. the OS closed
+  /// the socket after app suspension). Attempts to restart the proxy, then
+  /// reloads the native player if needed to refresh stale proxy URLs.
+  Future<void> _recoverProxy() async {
+    if (_disposed || _proxy._restarting) return;
+
+    // If the player is not actively playing, don't restart the proxy eagerly.
+    // • _active=false  → ensureRunning() is called by _onLoad() on the next
+    //   play/load, which will call start() and bind a fresh port.
+    // • _active=true, paused → play() detects !_proxy._running and calls
+    //   _setPlatformActive(true, force: true) to reload and restart the proxy.
+    if (!playing) return;
+
+    _proxy._restarting = true;
+    try {
+      final samePort = await _proxy._restart();
+
+      // If the native platform is not active, skip the reload. The next
+      // play() → _setPlatformActive(true) will call ensureRunning() (proxy is
+      // already running) and _onLoad() will register fresh URLs.
+      if (!_active || _disposed || _playlist.children.isEmpty) return;
+
+      // Even with the same port, AVPlayer may have already reported a
+      // connection error and won't auto-retry — we still need to reload it.
+      // Only skip the reload if same-port restart succeeded AND the native
+      // player has no errors AND is in a healthy (non-idle) state.
+      final nativeIsHealthy = samePort &&
+          playbackEvent.errorCode == null &&
+          processingState != ProcessingState.idle;
+      if (nativeIsHealthy) return;
+
+      final idx = currentIndex;
+      // We need to use the update position here instead of the estimated duration
+      final pos = playbackEvent.updatePosition;
+      final wasPlaying = playing;
+      try {
+        await _load(
+          await _platform,
+          _playlist,
+          initialSeekValues: (index: idx, position: pos),
+        );
+        if (wasPlaying && playing) {
+          await (await _platform).play(PlayRequest());
+        }
+      } on PlayerInterruptedException {
+        // A concurrent setAudioSource() or play()→_setPlatformActive(true)
+        // interrupted _load() — that call will handle recovery correctly.
+      } catch (_) {
+        // Reload failed; the player will surface the error naturally.
+      }
+    } finally {
+      _proxy._restarting = false;
     }
   }
 
@@ -1932,6 +2037,30 @@ class PlayerEvent {
   String toString() => "{playbackEvent=$playbackEvent, playing=$playing}";
 }
 
+/// Represents an error for an individual audio source in a playlist.
+class PlayerItemError {
+  /// The platform-specific error code.
+  final int code;
+
+  /// The human-readable error message.
+  final String message;
+
+  PlayerItemError({required this.code, required this.message});
+
+  @override
+  bool operator ==(Object other) =>
+      other.runtimeType == runtimeType &&
+      other is PlayerItemError &&
+      code == other.code &&
+      message == other.message;
+
+  @override
+  int get hashCode => Object.hash(code, message);
+
+  @override
+  String toString() => '{code=$code, message=$message}';
+}
+
 /// Encapsulates the playback state and current position of the player.
 class PlaybackEvent {
   /// The current processing state.
@@ -1983,6 +2112,10 @@ class PlaybackEvent {
   /// An entry is `null` when the duration of that source is not yet known.
   final List<Duration?> loadedDurationPerIndex;
 
+  /// The error for each indexed audio source in the playlist, or `null` if
+  /// no error has occurred for that source.
+  final List<PlayerItemError?> errorsPerItem;
+
   PlaybackEvent({
     this.processingState = ProcessingState.idle,
     DateTime? updateTime,
@@ -1996,6 +2129,7 @@ class PlaybackEvent {
     this.errorMessage,
     this.bufferedPositionPerIndex = const [],
     this.loadedDurationPerIndex = const [],
+    this.errorsPerItem = const [],
   }) : updateTime = updateTime ?? DateTime.now();
 
   /// Returns a copy of this event with given properties replaced.
@@ -2012,6 +2146,7 @@ class PlaybackEvent {
     String? errorMessage,
     List<Duration>? bufferedPositionPerIndex,
     List<Duration?>? loadedDurationPerIndex,
+    List<PlayerItemError?>? errorsPerItem,
   }) =>
       PlaybackEvent(
         processingState: processingState ?? this.processingState,
@@ -2029,6 +2164,7 @@ class PlaybackEvent {
             bufferedPositionPerIndex ?? this.bufferedPositionPerIndex,
         loadedDurationPerIndex:
             loadedDurationPerIndex ?? this.loadedDurationPerIndex,
+        errorsPerItem: errorsPerItem ?? this.errorsPerItem,
       );
 
   @override
@@ -2045,6 +2181,7 @@ class PlaybackEvent {
         errorMessage,
         ...bufferedPositionPerIndex,
         ...loadedDurationPerIndex,
+        ...errorsPerItem,
       ]);
 
   @override
@@ -2062,7 +2199,8 @@ class PlaybackEvent {
       errorCode == other.errorCode &&
       errorMessage == other.errorMessage &&
       _listEquals(bufferedPositionPerIndex, other.bufferedPositionPerIndex) &&
-      _listEquals(loadedDurationPerIndex, other.loadedDurationPerIndex);
+      _listEquals(loadedDurationPerIndex, other.loadedDurationPerIndex) &&
+      _listEquals(errorsPerItem, other.errorsPerItem);
 
   @override
   String toString() =>
@@ -2555,6 +2693,10 @@ class AndroidExtractorOptions {
 class _ProxyHttpServer {
   late HttpServer _server;
   bool _running = false;
+  int? _lastPort;
+  bool _restarting = false;
+
+  StreamSubscription<HttpRequest>? _listenerSubscription;
 
   /// Maps request keys to [_ProxyHandler]s.
   final Map<String, _ProxyHandler> _handlerMap = {};
@@ -2612,7 +2754,12 @@ class _ProxyHttpServer {
   Future<dynamic> start() async {
     _running = true;
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-    _server.listen((request) async {
+    _lastPort = _server.port;
+    _setupListener();
+  }
+
+  void _setupListener() {
+    _listenerSubscription = _server.listen((request) async {
       if (request.method == 'GET') {
         final uriPath = _requestKey(request.uri);
         final handler = _handlerMap[uriPath]!;
@@ -2625,11 +2772,71 @@ class _ProxyHttpServer {
     });
   }
 
+  Future<bool> _restart() async {
+    try {
+      await stop(force: true);
+    } catch (_) {}
+    final samePort = await _restartSamePort();
+    if (samePort) return true;
+
+    await _restartNewPort();
+    return false;
+  }
+
+  /// Tries to restart the server on the same port as before. Returns true if
+  /// successful (port unchanged), false if the port was unavailable.
+  Future<bool> _restartSamePort() async {
+    if (_running) return true;
+    try {
+      _server =
+          await HttpServer.bind(InternetAddress.loopbackIPv4, _lastPort ?? 0);
+      _running = true;
+      _lastPort = _server.port;
+      _setupListener();
+      return true;
+    } catch (_) {
+      _running = false;
+      return false;
+    }
+  }
+
+  /// Restarts the server on a new random port.
+  Future<void> _restartNewPort() async {
+    try {
+      _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      _running = true;
+      _lastPort = _server.port;
+      _setupListener();
+    } catch (_) {}
+  }
+
+  /// Returns true when the proxy needs to be recovered.
+  /// Returns false immediately when the proxy was never started.
+  /// When [_running] is true, performs a lightweight TCP probe to catch
+  /// the race where the OS closed the socket before Dart's onDone fired.
+  Future<bool> _needsRecovery() async {
+    if (_lastPort == null) return false; // proxy never started
+    if (!_running) return true; // already known dead
+    try {
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        _server.port,
+        timeout: const Duration(milliseconds: 100),
+      );
+      socket.destroy();
+      return false;
+    } on SocketException {
+      _running = false;
+      return true;
+    }
+  }
+
   /// Stops the server
-  Future<dynamic> stop() async {
+  Future<dynamic> stop({bool force = false}) async {
+    _listenerSubscription?.cancel();
     if (!_running) return;
     _running = false;
-    return await _server.close();
+    return await _server.close(force: force);
   }
 }
 
