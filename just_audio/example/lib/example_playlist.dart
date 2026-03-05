@@ -64,10 +64,19 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             duration: const Duration(milliseconds: 200),
             tag: AudioMetadata(
                 album: "Silence 1", title: "Silence 1", artwork: "")),
-        FailableUriAudioSource(
-          uri: Uri.parse(
+        // FailableUriAudioSource(
+        //   uri: Uri.parse(
+        //       "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/00__e0b0794e75a6494a89cc548d976f6682.mp3"),
+        //   failCount: _failCount,
+        //   tag: AudioMetadata(
+        //     album: "AI DJ - Intro (Failable)",
+        //     title: "AI DJ - Intro (Failable)",
+        //     artwork: "",
+        //   ),
+        // ),
+        AudioSource.uri(
+          Uri.parse(
               "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/00__e0b0794e75a6494a89cc548d976f6682.mp3"),
-          failCount: _failCount,
           tag: AudioMetadata(
             album: "AI DJ - Intro",
             title: "AI DJ - Intro",
@@ -82,8 +91,8 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
           Uri.parse(
               "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/01__11dabf89a28b435288bafe86080d1a95.mp3"),
           tag: AudioMetadata(
-            album: "AI DJ - Highlight 1 - Intro (Failable)",
-            title: "AI DJ - Highlight 1 - Intro (Failable)",
+            album: "AI DJ - Highlight 1 - Intro ",
+            title: "AI DJ - Highlight 1 - Intro",
             artwork: "",
           ),
         ),
@@ -440,6 +449,20 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
               label: const Text('Reset Player'),
               onPressed: _resetPlayer,
             ),
+            if (!kIsWeb)
+              TextButton.icon(
+                icon: const Icon(Icons.power_off),
+                label: const Text('Kill Proxy'),
+                onPressed: () async {
+                  await _player.killProxyForTesting();
+                  _scaffoldMessengerKey.currentState?.showSnackBar(
+                    const SnackBar(
+                      content: Text('Proxy killed — watch for auto-recovery'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                },
+              ),
           ],
         ),
         body: SafeArea(
