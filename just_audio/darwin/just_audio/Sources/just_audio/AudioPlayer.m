@@ -708,7 +708,7 @@ static const BOOL DEBUG_LOG = NO;
                       minRemaining:(NSInteger)minRemaining
                          generation:(NSInteger)generation
                         itemsLoaded:(NSInteger)itemsLoaded {
-    static const NSInteger kMaxEnqueueItems = 20;
+    static const NSInteger kMaxEnqueueItems = 10;
     if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: invPos=%ld accumulatedUs=%lld minRemaining=%ld generation=%ld itemsLoaded=%ld orderCount=%ld",
           (long)invPos, (long long)accumulatedUs, (long)minRemaining, (long)generation, (long)itemsLoaded, (long)_order.count);
 
@@ -750,9 +750,15 @@ static const BOOL DEBUG_LOG = NO;
         return;
     }
 
-    if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: loading duration+playable async for invPos=%ld (sourceIndex=%ld)", (long)invPos, (long)si);
+    AVKeyValueStatus durationStatus = [asset statusOfValueForKey:@"duration" error:nil];
+    AVKeyValueStatus playableStatus = [asset statusOfValueForKey:@"playable" error:nil];
+    BOOL alreadyLoaded = (durationStatus == AVKeyValueStatusLoaded &&
+                          playableStatus == AVKeyValueStatusLoaded);
+    if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: %@ for invPos=%ld (sourceIndex=%ld)",
+          alreadyLoaded ? @"keys already loaded, skipping async" : @"loading duration+playable async",
+          (long)invPos, (long)si);
     __weak typeof(self) weakSelf = self;
-    [asset loadValuesAsynchronouslyForKeys:@[@"duration", @"playable"] completionHandler:^{
+    void (^completionHandler)(void) = ^{
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
@@ -810,7 +816,16 @@ static const BOOL DEBUG_LOG = NO;
                       (long)invPos, (long)(itemsLoaded + 1), (long long)newAccumulated);
             }
         });
-    }];
+    };
+
+    if (alreadyLoaded) {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: already loaded, running completion handler immediately");
+        completionHandler();
+    } else {
+        if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: loading duration+playable async for invPos=%ld (sourceIndex=%ld)", (long)invPos, (long)si);
+        [asset loadValuesAsynchronouslyForKeys:@[@"duration", @"playable"]
+                             completionHandler:completionHandler];
+    }
 }
 
 - (void)updatePosition {

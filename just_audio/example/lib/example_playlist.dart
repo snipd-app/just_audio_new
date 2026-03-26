@@ -51,19 +51,21 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       [];
 
   List<AudioSource> _buildPlaylist() => [
-        AudioSource.uri(
-          Uri.parse(
-              "https://storage.googleapis.com/ai_dj_audio/messages/users/D041uzAuqmeIRY5CvvE6nQUK3Vv2/msg_user_hey__7367922848854d57bc488cbd048ae324.mp3"),
-          tag: AudioMetadata(
-            album: "AI DJ - Hey",
-            title: "AI DJ - Hey",
-            artwork: "",
-          ),
-        ),
-        SilenceStreamAudioSource(
-            duration: const Duration(milliseconds: 200),
+        for (var i = 0; i < 12; i++) ...[
+          AudioSource.uri(
+            Uri.parse(
+                "https://storage.googleapis.com/ai_dj_audio/messages/users/D041uzAuqmeIRY5CvvE6nQUK3Vv2/msg_user_hey__7367922848854d57bc488cbd048ae324.mp3"),
             tag: AudioMetadata(
-                album: "Silence 1", title: "Silence 1", artwork: "")),
+              album: "AI DJ - Hey",
+              title: "AI DJ - Hey",
+              artwork: "",
+            ),
+          ),
+          SilenceStreamAudioSource(
+              duration: const Duration(milliseconds: 200),
+              tag: AudioMetadata(
+                  album: "Silence 1", title: "Silence 1", artwork: "")),
+        ],
         // FailableUriAudioSource(
         //   uri: Uri.parse(
         //       "https://storage.googleapis.com/ai_dj_audio/episode_highlights/578427c8-c579-4402-8914-a33f4461bd9f/00__e0b0794e75a6494a89cc548d976f6682.mp3"),
