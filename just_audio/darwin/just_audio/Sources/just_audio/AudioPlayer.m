@@ -708,7 +708,7 @@ static const BOOL DEBUG_LOG = NO;
                       minRemaining:(NSInteger)minRemaining
                          generation:(NSInteger)generation
                         itemsLoaded:(NSInteger)itemsLoaded {
-    static const NSInteger kMaxEnqueueItems = 10;
+    static const NSInteger kMaxEnqueueItems = 5;
     if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: invPos=%ld accumulatedUs=%lld minRemaining=%ld generation=%ld itemsLoaded=%ld orderCount=%ld",
           (long)invPos, (long long)accumulatedUs, (long)minRemaining, (long)generation, (long)itemsLoaded, (long)_order.count);
 
