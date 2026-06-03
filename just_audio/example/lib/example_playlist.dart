@@ -12,6 +12,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'media_kit_stub.dart' if (dart.library.io) 'media_kit_impl.dart';
+import 'package:audio_service/audio_service.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -19,10 +20,26 @@ import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_example/common.dart';
 import 'package:rxdart/rxdart.dart';
 
-void main() {
+/// Singleton audio handler that bridges [AudioPlayer] with audio_service so
+/// playback continues in the background and is controllable from the
+/// lock screen / notification / Control Center / Bluetooth controls.
+late final AudioPlayerHandler audioHandler;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   initMediaKit(); // Initialise just_audio_media_kit for Linux/Windows.
   // Enable gapless playback on Linux/Windows (experimental):
   // JustAudioMediaKit.prefetchPlaylist = true;
+  audioHandler = await AudioService.init(
+    builder: () => AudioPlayerHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId:
+          'com.ryanheise.just_audio_example.channel.audio',
+      androidNotificationChannelName: 'Playback',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+    ),
+  );
   runApp(const MyApp());
 }
 
@@ -39,6 +56,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   double _preferredForwardBufferSeconds = 20.0;
   bool _autoPlay = false;
   int _failCount = 5;
+  int _heyLoopCount = 12;
   List<Duration> _bufferedPerIndex = const [];
   List<Duration?> _durationPerIndex = const [];
   List<PlayerItemError?> _errorsPerIndex = const [];
@@ -47,11 +65,15 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   int? _pendingDelayIndex;
   Duration? _pendingBaselinePosition;
   String? _lastError;
+  final List<PlayerMediaEvent> _mediaEvents = [];
+  StreamSubscription<PlayerMediaEvent>? _mediaEventSub;
+  Timer? _killProxyTimer;
+  int _killProxySecondsLeft = 0;
   final List<(FailableUriAudioSource, VoidCallback)> _attemptsSubscriptions =
       [];
 
   List<AudioSource> _buildPlaylist() => [
-        for (var i = 0; i < 12; i++) ...[
+        for (var i = 0; i < _heyLoopCount; i++) ...[
           AudioSource.uri(
             Uri.parse(
                 "https://storage.googleapis.com/ai_dj_audio/messages/users/D041uzAuqmeIRY5CvvE6nQUK3Vv2/msg_user_hey__7367922848854d57bc488cbd048ae324.mp3"),
@@ -161,7 +183,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
   }
 
   AudioPlayer _createPlayer() {
-    return AudioPlayer(
+    final player = AudioPlayer(
       maxSkipsOnError: 3,
       audioLoadConfiguration: AudioLoadConfiguration(
         darwinLoadControl: DarwinLoadControl(
@@ -179,9 +201,16 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       ),
       // useLazyPreparation: false,
     );
+    // Bind the player to the background audio handler so playback continues
+    // when the app is backgrounded and is controllable from the lock screen.
+    audioHandler.setPlayer(player);
+    return player;
   }
 
   Future<void> _resetPlayer() async {
+    _killProxyTimer?.cancel();
+    _killProxyTimer = null;
+    _killProxySecondsLeft = 0;
     await _player.dispose();
     setState(() {
       _player = _createPlayer();
@@ -190,6 +219,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       _errorsPerIndex = const [];
       _playDelayPerIndex = {};
       _lastError = null;
+      _mediaEvents.clear();
     });
     _pendingDelayIndex = null;
     _indexChangeTime = null;
@@ -203,6 +233,27 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     _player.errorStream.listen((e) {
       print('A stream error occurred: $e');
       setState(() => _lastError = e.toString());
+    });
+
+    _mediaEventSub?.cancel();
+    _mediaEventSub = _player.mediaEventStream.listen((event) {
+      print('>> media event: $event');
+      setState(() {
+        _mediaEvents.insert(0, event);
+        if (_mediaEvents.length > 20) _mediaEvents.removeLast();
+      });
+      _scaffoldMessengerKey.currentState
+        ?..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            backgroundColor: _mediaEventColor(event.type),
+            duration: const Duration(seconds: 4),
+            content: Text(
+              '${_mediaEventLabel(event.type)}'
+              '${event.detail != null ? ' — ${event.detail}' : ''}',
+            ),
+          ),
+        );
     });
 
     int? lastSeenIndex;
@@ -307,11 +358,161 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
     _pendingBaselinePosition = null;
   }
 
+  static String _mediaEventLabel(PlayerMediaEventType type) {
+    switch (type) {
+      case PlayerMediaEventType.proxyLost:
+        return 'Proxy lost';
+      case PlayerMediaEventType.proxyRecovered:
+        return 'Proxy recovered';
+      case PlayerMediaEventType.iosMediaServicesLost:
+        return 'iOS media services lost';
+      case PlayerMediaEventType.iosMediaServicesReset:
+        return 'iOS media services reset';
+    }
+  }
+
+  static Color _mediaEventColor(PlayerMediaEventType type) {
+    switch (type) {
+      case PlayerMediaEventType.proxyLost:
+      case PlayerMediaEventType.iosMediaServicesLost:
+        return Colors.red.shade700;
+      case PlayerMediaEventType.proxyRecovered:
+      case PlayerMediaEventType.iosMediaServicesReset:
+        return Colors.green.shade700;
+    }
+  }
+
+  static String _fmtClock(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:'
+      '${t.minute.toString().padLeft(2, '0')}:'
+      '${t.second.toString().padLeft(2, '0')}.'
+      '${t.millisecond.toString().padLeft(3, '0')}';
+
   String _fmtDuration(Duration d) {
     final s = d.inMilliseconds / 1000.0;
     return s >= 60
         ? '${d.inMinutes}m${(d.inSeconds % 60).toString().padLeft(2, '0')}s'
         : '${s.toStringAsFixed(1)}s';
+  }
+
+  /// Schedules the proxy to be killed in 5 seconds. This lets you background
+  /// the app first so the proxy dies while suspended, reproducing the
+  /// foreground-resume recovery path.
+  void _scheduleKillProxy() {
+    _killProxyTimer?.cancel();
+    setState(() => _killProxySecondsLeft = 5);
+    _scaffoldMessengerKey.currentState
+      ?..clearSnackBars()
+      ..showSnackBar(
+        const SnackBar(
+          content: Text('Proxy dies in 5s — background the app now'),
+          duration: Duration(seconds: 5),
+        ),
+      );
+    _killProxyTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      setState(() => _killProxySecondsLeft--);
+      if (_killProxySecondsLeft <= 0) {
+        timer.cancel();
+        _killProxyTimer = null;
+        await _player.killProxyForTesting();
+        _scaffoldMessengerKey.currentState?.showSnackBar(
+          const SnackBar(
+            content: Text('Proxy killed — watch for auto-recovery'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    });
+  }
+
+  /// Directly simulates the hypothesized stale-index race: pretends just_audio's
+  /// tracked index lagged one item behind the live player, then re-runs the
+  /// queue rebuild. If the hypothesis holds, the audio jumps backward to the
+  /// start of the previous item. Tap this WHILE PLAYING (a few items in, so
+  /// there's a previous item to fall back to).
+  Future<void> _simulateStaleIndexReseat() async {
+    try {
+      final snapshot =
+          await _player.simulateStaleIndexReseatForTesting(stepsBack: 2);
+      _scaffoldMessengerKey.currentState
+        ?..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(snapshot == null
+                ? 'Simulated stale-index re-seat'
+                : 'Re-seat: live=${snapshot['live']} → forced=${snapshot['stale']}, now=${snapshot['after']}'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+    } catch (e) {
+      _scaffoldMessengerKey.currentState?.showSnackBar(
+        SnackBar(content: Text('simulateStaleIndexReseat unsupported: $e')),
+      );
+    }
+  }
+
+  Widget _buildMediaEventsPanel() {
+    if (_mediaEvents.isEmpty) return const SizedBox.shrink();
+    final latest = _mediaEvents.first;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: _mediaEventColor(latest.type).withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: _mediaEventColor(latest.type)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.cable, size: 14),
+              const SizedBox(width: 4),
+              Text(
+                'Media events (${_mediaEvents.length})',
+                style:
+                    const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+              ),
+              const Spacer(),
+              GestureDetector(
+                onTap: () => setState(() => _mediaEvents.clear()),
+                child: Icon(Icons.close, size: 14, color: Colors.grey.shade600),
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 96),
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (final e in _mediaEvents)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 1),
+                      child: Text(
+                        '${_fmtClock(e.time)}  ${_mediaEventLabel(e.type)}'
+                        '${e.detail != null ? ' — ${e.detail}' : ''}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _mediaEventColor(e.type),
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget? _buildItemSubtitle(int i, AudioSource source) {
@@ -412,6 +613,8 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
       source.attemptsNotifier.removeListener(cb);
     }
     _attemptsSubscriptions.clear();
+    _mediaEventSub?.cancel();
+    _killProxyTimer?.cancel();
     ambiguate(WidgetsBinding.instance)!.removeObserver(this);
     _player.dispose();
     super.dispose();
@@ -419,12 +622,10 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused) {
-      // Release the player's resources when not in use. We use "stop" so that
-      // if the app resumes later, it will still remember what position to
-      // resume from.
-      _player.stop();
-    }
+    // We intentionally do NOT stop the player when the app is backgrounded.
+    // The audio_service handler keeps the audio session active and the
+    // platform foreground service alive so playback continues in the
+    // background, with controls surfaced on the lock screen / notification.
   }
 
   Stream<PositionData> get _positionDataStream =>
@@ -454,16 +655,17 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
             if (!kIsWeb)
               TextButton.icon(
                 icon: const Icon(Icons.power_off),
-                label: const Text('Kill Proxy'),
-                onPressed: () async {
-                  await _player.killProxyForTesting();
-                  _scaffoldMessengerKey.currentState?.showSnackBar(
-                    const SnackBar(
-                      content: Text('Proxy killed — watch for auto-recovery'),
-                      duration: Duration(seconds: 2),
-                    ),
-                  );
-                },
+                label: Text(_killProxySecondsLeft > 0
+                    ? 'Killing in ${_killProxySecondsLeft}s'
+                    : 'Kill Proxy in 5s'),
+                onPressed:
+                    _killProxySecondsLeft > 0 ? null : _scheduleKillProxy,
+              ),
+            if (!kIsWeb)
+              TextButton.icon(
+                icon: const Icon(Icons.fast_rewind),
+                label: const Text('Sim stale re-seat'),
+                onPressed: _simulateStaleIndexReseat,
               ),
           ],
         ),
@@ -520,6 +722,7 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                   ],
                 ],
               ),
+              _buildMediaEventsPanel(),
               StreamBuilder<PositionData>(
                 stream: _positionDataStream,
                 builder: (context, snapshot) {
@@ -532,6 +735,25 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                     onChangeEnd: (newPosition) {
                       _player.seek(newPosition);
                     },
+                  );
+                },
+              ),
+              StreamBuilder<(int?, Duration)>(
+                stream: Rx.combineLatest2(
+                  _player.currentIndexStream,
+                  _player.positionStream,
+                  (int? index, Duration position) => (index, position),
+                ),
+                builder: (context, snapshot) {
+                  final (index, position) =
+                      snapshot.data ?? (null, Duration.zero);
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                    child: Text(
+                      'Index: ${index ?? '-'} • Position: ${_fmtDuration(position)}',
+                      style:
+                          TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                    ),
                   );
                 },
               ),
@@ -568,6 +790,18 @@ class MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 max: 20,
                 onChanged: (v) async {
                   setState(() => _failCount = v);
+                  final playlist = _buildPlaylist();
+                  _subscribeToAttemptsNotifiers(playlist);
+                  await _player.setAudioSources(playlist);
+                },
+              ),
+              _IntSlider(
+                label: '"Hey" loop count',
+                value: _heyLoopCount,
+                min: 0,
+                max: 30,
+                onChanged: (v) async {
+                  setState(() => _heyLoopCount = v);
                   final playlist = _buildPlaylist();
                   _subscribeToAttemptsNotifiers(playlist);
                   await _player.setAudioSources(playlist);
@@ -909,6 +1143,126 @@ class AudioMetadata {
     required this.title,
     required this.artwork,
   });
+}
+
+/// Bridges a just_audio [AudioPlayer] to audio_service.
+///
+/// This keeps audio playing while the app is in the background and exposes
+/// transport controls + now-playing metadata to the OS (lock screen,
+/// notification, Control Center, and Bluetooth/headset buttons).
+///
+/// The handler does not own the player: the UI creates (and re-creates) the
+/// player and calls [setPlayer] to wire it up. This lets the example keep its
+/// existing "Reset Player" / config-change flow while still driving the
+/// background service.
+class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
+  AudioPlayer? _player;
+  final List<StreamSubscription<dynamic>> _subs = [];
+
+  /// Attaches (or re-attaches) the handler to [player], forwarding its streams
+  /// to audio_service and routing transport callbacks back to it.
+  void setPlayer(AudioPlayer player) {
+    for (final sub in _subs) {
+      sub.cancel();
+    }
+    _subs.clear();
+    _player = player;
+
+    _subs.add(player.playbackEventStream.listen(_broadcastState));
+    // `playing` lives outside PlaybackEvent, so refresh the state on its change.
+    _subs.add(player.playingStream
+        .listen((_) => _broadcastState(player.playbackEvent)));
+    _subs.add(player.sequenceStateStream.listen((seqState) {
+      final sequence = seqState.sequence;
+      final items = <MediaItem>[
+        for (var i = 0; i < sequence.length; i++) _toMediaItem(i, sequence[i]),
+      ];
+      queue.add(items);
+      final index = seqState.currentIndex;
+      if (index != null && index >= 0 && index < items.length) {
+        mediaItem.add(items[index]);
+      }
+    }));
+  }
+
+  void _broadcastState(PlaybackEvent event) {
+    final player = _player;
+    if (player == null) return;
+    final playing = player.playing;
+    playbackState.add(playbackState.value.copyWith(
+      controls: [
+        MediaControl.skipToPrevious,
+        if (playing) MediaControl.pause else MediaControl.play,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
+      },
+      androidCompactActionIndices: const [0, 1, 2],
+      processingState: _mapProcessingState(event.processingState),
+      playing: playing,
+      updatePosition: player.position,
+      bufferedPosition: player.bufferedPosition,
+      speed: player.speed,
+      queueIndex: event.currentIndex,
+    ));
+  }
+
+  static AudioProcessingState _mapProcessingState(ProcessingState state) {
+    switch (state) {
+      case ProcessingState.idle:
+        return AudioProcessingState.idle;
+      case ProcessingState.loading:
+        return AudioProcessingState.loading;
+      case ProcessingState.buffering:
+        return AudioProcessingState.buffering;
+      case ProcessingState.ready:
+        return AudioProcessingState.ready;
+      case ProcessingState.completed:
+        return AudioProcessingState.completed;
+    }
+  }
+
+  static MediaItem _toMediaItem(int index, IndexedAudioSource source) {
+    final tag = source.tag;
+    final title = tag is AudioMetadata ? tag.title : 'Track ${index + 1}';
+    final album = tag is AudioMetadata ? tag.album : null;
+    final artwork = tag is AudioMetadata ? tag.artwork : '';
+    return MediaItem(
+      id: '$index',
+      title: title,
+      album: album,
+      duration: source.duration,
+      artUri: artwork.isNotEmpty ? Uri.tryParse(artwork) : null,
+    );
+  }
+
+  @override
+  Future<void> play() async => _player?.play();
+
+  @override
+  Future<void> pause() async => _player?.pause();
+
+  @override
+  Future<void> seek(Duration position) async => _player?.seek(position);
+
+  @override
+  Future<void> stop() async => _player?.stop();
+
+  @override
+  Future<void> skipToNext() async => _player?.seekToNext();
+
+  @override
+  Future<void> skipToPrevious() async => _player?.seekToPrevious();
+
+  @override
+  Future<void> skipToQueueItem(int index) async =>
+      _player?.seek(Duration.zero, index: index);
+
+  @override
+  Future<void> setSpeed(double speed) async => _player?.setSpeed(speed);
 }
 
 /// Generates silent WAV audio of a given duration.

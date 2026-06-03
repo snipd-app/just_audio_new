@@ -146,6 +146,7 @@ class AudioPlayer {
   final _icyMetadataSubject = BehaviorSubject<IcyMetadata?>.seeded(null);
   final _androidAudioSessionIdSubject = BehaviorSubject<int?>.seeded(null);
   final _errorSubject = PublishSubject<PlayerException>();
+  final _mediaEventSubject = PublishSubject<PlayerMediaEvent>();
 
   // independent streams
   final _playingSubject = BehaviorSubject.seeded(false);
@@ -696,6 +697,15 @@ class AudioPlayer {
 
   /// A stream of errors broadcast by the player.
   Stream<PlayerException> get errorStream => _errorSubject.stream;
+
+  /// A stream of low-level media lifecycle events, useful for diagnostics.
+  ///
+  /// This reports when the local HTTP proxy is lost and recovered (see
+  /// [PlayerMediaEventType.proxyLost] / [PlayerMediaEventType.proxyRecovered]),
+  /// and on iOS, when the system media server is lost or reset (see
+  /// [PlayerMediaEventType.iosMediaServicesLost] /
+  /// [PlayerMediaEventType.iosMediaServicesReset]).
+  Stream<PlayerMediaEvent> get mediaEventStream => _mediaEventSubject.stream;
 
   /// A stream broadcasting every position discontinuity.
   Stream<PositionDiscontinuity> get positionDiscontinuityStream =>
@@ -1519,6 +1529,7 @@ class AudioPlayer {
       await _icyMetadataSubject.close();
       await _androidAudioSessionIdSubject.close();
       await _errorSubject.close();
+      await _mediaEventSubject.close();
       await _playerStateSubject.close();
       await _skipSilenceEnabledSubject.close();
       await _positionDiscontinuitySubject.close();
@@ -1614,6 +1625,18 @@ class AudioPlayer {
           _sequenceStateSubject.add(sequenceState.copyWith(
               shuffleModeEnabled:
                   message.shuffleMode != ShuffleModeMessage.none));
+        }
+        if (message.mediaServicesEvent != null && !_mediaEventSubject.isClosed) {
+          switch (message.mediaServicesEvent) {
+            case 'lost':
+              _mediaEventSubject
+                  .add(PlayerMediaEvent(PlayerMediaEventType.iosMediaServicesLost));
+              break;
+            case 'reset':
+              _mediaEventSubject.add(
+                  PlayerMediaEvent(PlayerMediaEventType.iosMediaServicesReset));
+              break;
+          }
         }
       }, onDone: () {
         _playerDataSubscription = null;
@@ -1881,6 +1904,16 @@ class AudioPlayer {
     }
   }
 
+  /// TEST-ONLY: asks the native platform to directly simulate the lazy-queue
+  /// stale-index race — pretend the tracked index lagged [stepsBack] item(s)
+  /// behind the live player, then re-run the queue rebuild — to verify whether
+  /// that re-seats the queue and causes an audible backward jump. Returns the
+  /// native `{live, stale, after}` index snapshot for analysis.
+  Future<Map<dynamic, dynamic>?> simulateStaleIndexReseatForTesting(
+      {int stepsBack = 1}) async {
+    return (await _platform).simulateStaleIndexReseatForTesting(stepsBack);
+  }
+
   /// Clears the plugin's internal asset cache directory. Call this when the
   /// app's assets have changed to force assets to be re-fetched from the asset
   /// bundle.
@@ -1904,6 +1937,10 @@ class AudioPlayer {
     //   _setPlatformActive(true, force: true) to reload and restart the proxy.
     if (!playing) return;
 
+    if (!_mediaEventSubject.isClosed) {
+      _mediaEventSubject.add(PlayerMediaEvent(PlayerMediaEventType.proxyLost));
+    }
+
     _proxy._restarting = true;
     try {
       final samePort = await _proxy._restart();
@@ -1920,7 +1957,10 @@ class AudioPlayer {
       final nativeIsHealthy = samePort &&
           playbackEvent.errorCode == null &&
           processingState != ProcessingState.idle;
-      if (nativeIsHealthy) return;
+      if (nativeIsHealthy) {
+        _emitProxyRecovered(reloaded: false);
+        return;
+      }
 
       final idx = currentIndex;
       // We need to use the update position here instead of the estimated duration
@@ -1935,6 +1975,7 @@ class AudioPlayer {
         if (wasPlaying && playing) {
           await (await _platform).play(PlayRequest());
         }
+        _emitProxyRecovered(reloaded: true);
       } on PlayerInterruptedException {
         // A concurrent setAudioSource() or play()→_setPlatformActive(true)
         // interrupted _load() — that call will handle recovery correctly.
@@ -1944,6 +1985,14 @@ class AudioPlayer {
     } finally {
       _proxy._restarting = false;
     }
+  }
+
+  void _emitProxyRecovered({required bool reloaded}) {
+    if (_disposed || _mediaEventSubject.isClosed) return;
+    _mediaEventSubject.add(PlayerMediaEvent(
+      PlayerMediaEventType.proxyRecovered,
+      detail: reloaded ? 'player reloaded' : 'proxy restarted (no reload)',
+    ));
   }
 
   Exception _convertException(PlatformException e) {
@@ -1987,6 +2036,47 @@ class PlayerException implements Exception {
 
   @override
   String toString() => "($code) $message";
+}
+
+/// The kind of a [PlayerMediaEvent].
+enum PlayerMediaEventType {
+  /// The local HTTP proxy was detected to be dead (e.g. the OS closed its
+  /// socket while the app was suspended).
+  proxyLost,
+
+  /// The local HTTP proxy was restarted, and the native player was reloaded if
+  /// needed to refresh stale proxy URLs.
+  proxyRecovered,
+
+  /// (iOS only) The system media server was lost
+  /// (`AVAudioSessionMediaServicesWereLostNotification`). All audio objects are
+  /// invalid until a corresponding reset arrives.
+  iosMediaServicesLost,
+
+  /// (iOS only) The system media server was reset
+  /// (`AVAudioSessionMediaServicesWereResetNotification`). Audio objects must
+  /// be recreated.
+  iosMediaServicesReset,
+}
+
+/// A low-level media lifecycle event broadcast on [AudioPlayer.mediaEventStream]
+/// for diagnostics (proxy recovery and iOS media-services notifications).
+class PlayerMediaEvent {
+  /// What happened.
+  final PlayerMediaEventType type;
+
+  /// When the event was observed.
+  final DateTime time;
+
+  /// Optional human-readable detail.
+  final String? detail;
+
+  PlayerMediaEvent(this.type, {this.detail, DateTime? time})
+      : time = time ?? DateTime.now();
+
+  @override
+  String toString() =>
+      'PlayerMediaEvent(${type.name}${detail != null ? ', $detail' : ''})';
 }
 
 /// An error that occurs when one operation on the player has been interrupted
@@ -2467,13 +2557,28 @@ class DarwinLoadControl {
   ///
   /// At least 1 item ahead of the current item is always preloaded regardless
   /// of this value. Additional items are preloaded until the sum of their
-  /// durations meets or exceeds [preloadBufferDuration]. Loading stops at a
-  /// hard cap of 20 items to guard against indefinite-duration streams.
+  /// durations meets or exceeds [preloadBufferDuration], or until
+  /// [maxPreloadItems] items have been enqueued, whichever comes first.
   ///
   /// Only has effect when [AudioPlayer]'s useLazyPreparation is true (the
   /// default). Particularly useful when playlist items are short, giving future
   /// items more time to have their metadata loaded before they are needed.
   final Duration? preloadBufferDuration;
+
+  /// (iOS/macOS) Hard cap on the number of upcoming items the preload chain
+  /// enqueues at once, guarding against indefinite-duration streams and
+  /// bounding concurrent decode/buffer pressure on the system media server.
+  ///
+  /// Defaults to 5 when `null`. Lower values reduce the risk of "Media services
+  /// were reset" under resource pressure; higher values give smoother
+  /// transitions for very short items at the cost of more concurrent buffering.
+  final int? maxPreloadItems;
+
+  /// (iOS/macOS) Whether to observe ICY (SHOUTcast/Icecast) in-band timed
+  /// metadata. This is only ever emitted by live streams; for finite content
+  /// (files, clips, short segments) it is pure overhead, so set it to `false`
+  /// when the playlist contains no live streams. Defaults to `true`.
+  final bool useIcyMetadata;
 
   const DarwinLoadControl({
     this.automaticallyWaitsToMinimizeStalling = true,
@@ -2481,6 +2586,8 @@ class DarwinLoadControl {
     this.canUseNetworkResourcesForLiveStreamingWhilePaused = false,
     this.preferredPeakBitRate,
     this.preloadBufferDuration,
+    this.maxPreloadItems,
+    this.useIcyMetadata = true,
   });
 
   DarwinLoadControlMessage _toMessage() => DarwinLoadControlMessage(
@@ -2491,6 +2598,8 @@ class DarwinLoadControl {
             canUseNetworkResourcesForLiveStreamingWhilePaused,
         preferredPeakBitRate: preferredPeakBitRate,
         preloadBufferDuration: preloadBufferDuration,
+        maxPreloadItems: maxPreloadItems,
+        useIcyMetadata: useIcyMetadata,
       );
 }
 

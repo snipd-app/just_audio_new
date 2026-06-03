@@ -9,6 +9,7 @@ dependencies:
   flutter:
     sdk: flutter
   audio_session: ^0.2.0
+  audio_service: ^0.18.15
   rxdart: ^0.28.0
   just_audio_media_kit: ^2.1.0
   media_kit_libs_linux: any

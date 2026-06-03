@@ -23,6 +23,9 @@ static const BOOL DEBUG_LOG = NO;
     NSObject<FlutterPluginRegistrar>* _registrar;
     int64_t _preloadBufferDurationUs;
     NSInteger _preloadGeneration;
+    NSInteger _maxPreloadItems;
+    NSTimeInterval _lastPreloadChainTime;
+    BOOL _preloadChainPending;
     FlutterMethodChannel *_methodChannel;
     BetterEventChannel *_eventChannel;
     BetterEventChannel *_dataEventChannel;
@@ -100,6 +103,9 @@ static const BOOL DEBUG_LOG = NO;
     _automaticallyWaitsToMinimizeStalling = YES;
     _allowsExternalPlayback = NO;
     _loadControl = nil;
+    _maxPreloadItems = 5;
+    _lastPreloadChainTime = 0;
+    _preloadChainPending = NO;
     if (loadConfiguration != (id)[NSNull null]) {
         NSDictionary *map = loadConfiguration[@"darwinLoadControl"];
         if (map != (id)[NSNull null]) {
@@ -110,6 +116,10 @@ static const BOOL DEBUG_LOG = NO;
             _automaticallyWaitsToMinimizeStalling = (BOOL)[map[@"automaticallyWaitsToMinimizeStalling"] boolValue];
             NSNumber *preloadBufferDuration = map[@"preloadBufferDuration"];
             _preloadBufferDurationUs = (preloadBufferDuration && preloadBufferDuration != (id)[NSNull null]) ? [preloadBufferDuration longLongValue] : 0;
+            NSNumber *maxPreloadItems = map[@"maxPreloadItems"];
+            if (maxPreloadItems && maxPreloadItems != (id)[NSNull null] && [maxPreloadItems integerValue] > 0) {
+                _maxPreloadItems = [maxPreloadItems integerValue];
+            }
         }
     }
     if (!_loadControl) {
@@ -129,7 +139,52 @@ static const BOOL DEBUG_LOG = NO;
     [_methodChannel setMethodCallHandler:^(FlutterMethodCall* call, FlutterResult result) {
         [weakSelf handleMethodCall:call result:result];
     }];
+    [self addMediaServicesObservers];
     return self;
+}
+
+// Observe the iOS AVAudioSession "media services" notifications. These fire
+// when the system media server (mediaserverd) is lost and/or reset, at which
+// point all audio objects (AVPlayer, AVAudioSession, etc.) become invalid and
+// must be recreated. We forward these to Dart on the data channel so the app
+// can be notified the moment they happen.
+- (void)addMediaServicesObservers {
+#if TARGET_OS_IOS
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onMediaServicesLost:)
+                                                 name:AVAudioSessionMediaServicesWereLostNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onMediaServicesReset:)
+                                                 name:AVAudioSessionMediaServicesWereResetNotification
+                                               object:nil];
+#endif
+}
+
+- (void)removeMediaServicesObservers {
+#if TARGET_OS_IOS
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionMediaServicesWereLostNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionMediaServicesWereResetNotification object:nil];
+#endif
+}
+
+- (void)onMediaServicesLost:(NSNotification *)notification {
+    [self sendMediaServicesEvent:@"lost"];
+}
+
+- (void)onMediaServicesReset:(NSNotification *)notification {
+    [self sendMediaServicesEvent:@"reset"];
+}
+
+- (void)sendMediaServicesEvent:(NSString *)event {
+    // AVAudioSession notifications may be delivered off the main thread, but the
+    // Flutter event sink must be invoked on the platform (main) thread.
+    __weak __typeof__(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_dataEventChannel sendEvent:@{@"mediaServicesEvent": event}];
+    });
 }
 
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
@@ -144,6 +199,26 @@ static const BOOL DEBUG_LOG = NO;
         } else if ([@"pause" isEqualToString:call.method]) {
             [self pause];
             result(@{});
+        } else if ([@"simulateStaleIndexReseat" isEqualToString:call.method]) {
+            // TEST-ONLY: directly simulate the hypothesized race instead of trying
+            // to trigger it indirectly. We pretend just_audio's _index lagged
+            // [stepsBack] item(s) behind the live AVQueuePlayer currentItem, then
+            // run the exact enqueueFrom: that the currentItem-KVO _justAdvanced
+            // path would run ([self enqueueFrom:_index]). If the hypothesis holds,
+            // enqueueFrom: removes the genuinely-playing item and re-seats the
+            // queue onto the previous (already-played, seeked-to-zero) item, so
+            // audio audibly jumps backward. Remove before shipping.
+            int stepsBack = request[@"stepsBack"] != (id)[NSNull null]
+                ? [request[@"stepsBack"] intValue] : 1;
+            int live = [self indexForItem:(IndexedPlayerItem *)_player.currentItem];
+            int stale = live - stepsBack;
+            if (stale < 0) stale = 0;
+            NSLog(@"simulateStaleIndexReseat: live currentItem index=%d, _index=%d → forcing enqueueFrom(stale=%d) [stepsBack=%d, playing=%d]",
+                  live, _index, stale, stepsBack, _playing);
+            [self enqueueFrom:stale];
+            NSLog(@"simulateStaleIndexReseat: AFTER enqueueFrom → _index=%d, live currentItem index=%d",
+                  _index, [self indexForItem:(IndexedPlayerItem *)_player.currentItem]);
+            result(@{@"live": @(live), @"stale": @(stale), @"after": @([self indexForItem:(IndexedPlayerItem *)_player.currentItem])});
         } else if ([@"setVolume" isEqualToString:call.method]) {
             [self setVolume:(float)[request[@"volume"] doubleValue]];
             result(@{});
@@ -678,7 +753,34 @@ static const BOOL DEBUG_LOG = NO;
 
     [self updateEndAction];
 
-    [self startPreloadChain];
+    [self schedulePreloadChain];
+}
+
+/// Throttled entry point for the preload chain. When items are very short the
+/// player can advance many times per second, and each advance would otherwise
+/// restart the whole chain (bumping the generation, re-walking items, loading
+/// metadata). This coalesces those bursts: it runs immediately on the leading
+/// edge, then at most once per interval, with a single trailing run to top up
+/// the lookahead after a burst settles.
+- (void)schedulePreloadChain {
+    const NSTimeInterval interval = 0.3;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval elapsed = now - _lastPreloadChainTime;
+    if (elapsed >= interval) {
+        _lastPreloadChainTime = now;
+        [self startPreloadChain];
+    } else if (!_preloadChainPending) {
+        _preloadChainPending = YES;
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((interval - elapsed) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf->_preloadChainPending = NO;
+            strongSelf->_lastPreloadChainTime = [[NSDate date] timeIntervalSince1970];
+            [strongSelf startPreloadChain];
+        });
+    }
+    // else: a trailing run is already pending — coalesce.
 }
 
 - (void)startPreloadChain {
@@ -708,7 +810,7 @@ static const BOOL DEBUG_LOG = NO;
                       minRemaining:(NSInteger)minRemaining
                          generation:(NSInteger)generation
                         itemsLoaded:(NSInteger)itemsLoaded {
-    static const NSInteger kMaxEnqueueItems = 10;
+    const NSInteger kMaxEnqueueItems = _maxPreloadItems > 0 ? _maxPreloadItems : 5;
     if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: invPos=%ld accumulatedUs=%lld minRemaining=%ld generation=%ld itemsLoaded=%ld orderCount=%ld",
           (long)invPos, (long long)accumulatedUs, (long)minRemaining, (long)generation, (long)itemsLoaded, (long)_order.count);
 
@@ -1273,12 +1375,12 @@ static const BOOL DEBUG_LOG = NO;
                     [self enqueueFrom:_index];
                 } else {
                     [self updateEndAction];
-                    [self startPreloadChain];
+                    [self schedulePreloadChain];
                 }
             } else if (!_enqueuedAll) {
                 [self enqueueFrom:_index];
             } else {
-                [self startPreloadChain];
+                [self schedulePreloadChain];
             }
             _justAdvanced = NO;
         }
@@ -1717,6 +1819,7 @@ static const BOOL DEBUG_LOG = NO;
 }
 
 - (void)dispose:(BOOL)calledFromDealloc {
+    [self removeMediaServicesObservers];
     if (!_player) return;
     if (_processingState != psIdle) {
         [_player pause];

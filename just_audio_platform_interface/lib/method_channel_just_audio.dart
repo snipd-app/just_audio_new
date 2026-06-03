@@ -78,6 +78,13 @@ class MethodChannelAudioPlayer extends AudioPlayerPlatform {
   }
 
   @override
+  Future<Map<dynamic, dynamic>?> simulateStaleIndexReseatForTesting(
+      int stepsBack) async {
+    return await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'simulateStaleIndexReseat', {'stepsBack': stepsBack});
+  }
+
+  @override
   Future<SetSpeedResponse> setSpeed(SetSpeedRequest request) async {
     return SetSpeedResponse.fromMap((await _channel
         .invokeMethod<Map<dynamic, dynamic>>('setSpeed', request.toMap()))!);

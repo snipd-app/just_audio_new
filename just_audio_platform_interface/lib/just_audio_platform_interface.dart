@@ -96,6 +96,14 @@ abstract class AudioPlayerPlatform {
     throw UnimplementedError("setVolume() has not been implemented.");
   }
 
+  /// TEST-ONLY: asks the native platform to directly simulate the lazy-queue
+  /// stale-index race — pretend the tracked index lagged [stepsBack] item(s)
+  /// behind the live player and re-run the queue rebuild — to see whether it
+  /// causes an audible backward jump. No-op by default.
+  Future<Map<dynamic, dynamic>?> simulateStaleIndexReseatForTesting(
+          int stepsBack) async =>
+      null;
+
   /// Changes the playback speed.
   Future<SetSpeedResponse> setSpeed(SetSpeedRequest request) {
     throw UnimplementedError("setSpeed() has not been implemented.");
@@ -258,6 +266,12 @@ class PlayerDataMessage {
   // TODO: Eventually move other state here?
   // bufferedPosition, androidAudioSessionId, icyMetadata
 
+  /// A low-level media lifecycle signal from the native platform, currently
+  /// used on iOS to report `AVAudioSession` media services notifications.
+  /// Expected values are `"lost"` (media server died) and `"reset"` (media
+  /// server was reset and audio objects must be recreated).
+  final String? mediaServicesEvent;
+
   PlayerDataMessage({
     this.playing,
     this.volume,
@@ -265,6 +279,7 @@ class PlayerDataMessage {
     this.pitch,
     this.loopMode,
     this.shuffleMode,
+    this.mediaServicesEvent,
   });
 
   static PlayerDataMessage fromMap(Map<dynamic, dynamic> map) =>
@@ -279,6 +294,7 @@ class PlayerDataMessage {
         shuffleMode: map['shuffleMode'] != null
             ? ShuffleModeMessage.values[map['shuffleMode'] as int]
             : null,
+        mediaServicesEvent: map['mediaServicesEvent'] as String?,
       );
 }
 
@@ -981,12 +997,22 @@ class DarwinLoadControlMessage {
   /// is proactively loaded. See [DarwinLoadControl.preloadBufferDuration].
   final Duration? preloadBufferDuration;
 
+  /// (iOS/macOS) Hard cap on the number of upcoming items the preload chain
+  /// enqueues at once. See [DarwinLoadControl.maxPreloadItems].
+  final int? maxPreloadItems;
+
+  /// (iOS/macOS) Whether to observe ICY (SHOUTcast/Icecast) timed metadata.
+  /// See [DarwinLoadControl.useIcyMetadata].
+  final bool useIcyMetadata;
+
   DarwinLoadControlMessage({
     required this.automaticallyWaitsToMinimizeStalling,
     required this.preferredForwardBufferDuration,
     required this.canUseNetworkResourcesForLiveStreamingWhilePaused,
     required this.preferredPeakBitRate,
     required this.preloadBufferDuration,
+    this.maxPreloadItems,
+    this.useIcyMetadata = true,
   });
 
   Map<dynamic, dynamic> toMap() => <dynamic, dynamic>{
@@ -998,6 +1024,8 @@ class DarwinLoadControlMessage {
             canUseNetworkResourcesForLiveStreamingWhilePaused,
         'preferredPeakBitRate': preferredPeakBitRate,
         'preloadBufferDuration': preloadBufferDuration?.inMicroseconds,
+        'maxPreloadItems': maxPreloadItems,
+        'useIcyMetadata': useIcyMetadata,
       };
 }
 
