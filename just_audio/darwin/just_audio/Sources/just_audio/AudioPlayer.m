@@ -1033,6 +1033,7 @@ static const BOOL DEBUG_LOG = NO;
             if (_loopMode != lmLoopAll) {
                 [self updateEndAction];
             }
+            [self updatePosition];
             [self broadcastPlaybackEvent];
             _justAdvanced = YES;
         } else {
