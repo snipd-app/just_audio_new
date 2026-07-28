@@ -1592,6 +1592,13 @@ static const BOOL DEBUG_LOG = NO;
     if (newIndex != (id)[NSNull null]) {
         index = [newIndex intValue];
     }
+    // Seeking moves the playhead back into the queue, so it is no longer
+    // finished. Jumping to another item only leaves psCompleted when it has to
+    // buffer, which it doesn't when the target item already sits at the
+    // requested position, and while completed the position stops advancing.
+    if (_processingState == psCompleted) {
+        _processingState = psReady;
+    }
     if (index != _index) {
         // Jump to a new item
         /* if (_playing && index == _index + 1) { */
