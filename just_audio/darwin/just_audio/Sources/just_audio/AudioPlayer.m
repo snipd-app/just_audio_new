@@ -135,6 +135,8 @@ static const BOOL DEBUG_LOG = NO;
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     @try {
         //NSLog(@"method: %@ index=%d", call.method, _index);
+        if (DEBUG_LOG) NSLog(@"<< DART CALL: %@ (_index=%d, pos=%dms)",
+              call.method, _index, [self getCurrentPosition]);
         NSDictionary *request = (NSDictionary *)call.arguments;
         if ([@"load" isEqualToString:call.method]) {
             CMTime initialPosition = request[@"initialPosition"] == (id)[NSNull null] ? kCMTimeInvalid : CMTimeMake([request[@"initialPosition"] longLongValue], 1000000);
@@ -335,6 +337,11 @@ static const BOOL DEBUG_LOG = NO;
 - (void)checkForDiscontinuity {
     if (!_playing || CMTIME_IS_VALID(_seekPos) || _processingState == psCompleted) return;
     int position = [self getCurrentPosition];
+    // The restart signature: still on the same item, but the clock jumped back.
+    if (DEBUG_LOG && position + 200 < _lastPosition) {
+        NSLog(@"!!!! POSITION WENT BACKWARDS on item [%d]: %dms -> %dms (item restarted?)",
+              _index, _lastPosition, position);
+    }
     if (_processingState == psBuffering) {
         if (position > _lastPosition) {
             [self leaveBuffering:@"stall ended"];
@@ -418,7 +425,8 @@ static const BOOL DEBUG_LOG = NO;
 }
 
 - (void)broadcastPlaybackEvent {
-    if (DEBUG_LOG) NSLog(@"broadcastPlaybackEvent: _index=%d, _processingState=%ld", _index, (long)_processingState);
+    if (DEBUG_LOG) NSLog(@"broadcastPlaybackEvent: _index=%d, pos=%dms, playing=%d, rate=%.2f, _processingState=%ld",
+          _index, [self getCurrentPosition], _playing, _player.rate, (long)_processingState);
     [_eventChannel sendEvent:@{
             @"processingState": @(_processingState),
             @"updatePosition": @((long long)1000 * _updatePosition),
@@ -581,6 +589,13 @@ static const BOOL DEBUG_LOG = NO;
 
 - (void)enqueueFrom:(int)index {
     //NSLog(@"### enqueueFrom:%d", index);
+    if (DEBUG_LOG) {
+        NSArray *stack = [NSThread callStackSymbols];
+        NSString *caller = stack.count > 1 ? stack[1] : @"?";
+        NSLog(@"enqueueFrom: index=%d (was _index=%d), currentItem=[%d], pos=%dms, queueCount=%lu\n    called by: %@",
+              index, _index, [self indexForItem:(IndexedPlayerItem *)_player.currentItem],
+              [self getCurrentPosition], (unsigned long)_player.items.count, caller);
+    }
     _index = index;
 
     // Update the queue while keeping the currently playing item untouched.
@@ -607,12 +622,16 @@ static const BOOL DEBUG_LOG = NO;
             // once to _index.
         } else {
             //NSLog(@"Removing item %d", [self indexForItem:oldPlayerItems[i]]);
+            if (DEBUG_LOG) NSLog(@"enqueueFrom: removing queued item [%d]",
+                  [self indexForItem:oldPlayerItems[i]]);
             [_player removeItem:oldPlayerItems[i]];
         }
     }
     // In the second pass, remove the old item (if different from new item).
     if (oldItem && newItem != oldItem) {
         //NSLog(@"removing old item %d", [self indexForItem:oldItem]);
+        if (DEBUG_LOG) NSLog(@"enqueueFrom: removing the playing item [%d] because _index points at [%d]",
+              [self indexForItem:oldItem], [self indexForItem:newItem]);
         [_player removeItem:oldItem];
     }
 
@@ -634,6 +653,9 @@ static const BOOL DEBUG_LOG = NO;
                     break;
                 }
                 //NSLog(@"inserting item %d", si);
+                if (DEBUG_LOG) NSLog(@"enqueueFrom: inserting item [%d]%@", si,
+                      _indexedAudioSources[si].playerItem == _player.currentItem
+                          ? @"  <<<< RE-INSERTING THE ITEM THAT IS PLAYING" : @"");
                 [_player insertItem:_indexedAudioSources[si].playerItem afterItem:nil];
                 if (_loopMode == lmLoopOne) {
                     // We only want one item in the queue.
@@ -677,6 +699,17 @@ static const BOOL DEBUG_LOG = NO;
     }
 
     [self updateEndAction];
+
+    if (DEBUG_LOG) {
+        NSMutableString *queue = [NSMutableString string];
+        for (int i = 0; i < _player.items.count; i++) {
+            [queue appendFormat:@"%@%d", i ? @", " : @"",
+                  [self indexForItem:(IndexedPlayerItem *)_player.items[i]]];
+        }
+        NSLog(@"enqueueFrom: DONE — queue is now [%@], currentItem=[%d], pos=%dms",
+              queue, [self indexForItem:(IndexedPlayerItem *)_player.currentItem],
+              [self getCurrentPosition]);
+    }
 
     [self startPreloadChain];
 }
@@ -785,8 +818,10 @@ static const BOOL DEBUG_LOG = NO;
             if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur)) {
                 itemDurationUs = (int64_t)(CMTimeGetSeconds(dur) * 1e6);
             }
-            if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: asset loaded for invPos=%ld (sourceIndex=%ld) itemDurationUs=%lld",
-                  (long)invPos, (long)si, (long long)itemDurationUs);
+            NSString *assetUrl = [asset isKindOfClass:[AVURLAsset class]]
+                ? ((AVURLAsset *)asset).URL.lastPathComponent : @"(not a url asset)";
+            if (DEBUG_LOG) NSLog(@"_enqueueAndLoadFromInvPos: asset loaded for invPos=%ld (sourceIndex=%ld) itemDurationUs=%lld uri=%@",
+                  (long)invPos, (long)si, (long long)itemDurationUs, assetUrl);
 
             if (CMTIME_IS_VALID(dur) && !CMTIME_IS_INDEFINITE(dur) && si < (NSInteger)strongSelf->_loadedDurationsPerItem.count) {
                 strongSelf->_loadedDurationsPerItem[si] = @(itemDurationUs);
@@ -997,6 +1032,10 @@ static const BOOL DEBUG_LOG = NO;
 
     IndexedPlayerItem *endedPlayerItem = (IndexedPlayerItem *)notification.object;
     IndexedAudioSource *endedSource = endedPlayerItem.audioSource;
+    if (DEBUG_LOG) NSLog(@"onComplete: ended item=[%d] (%@), _index=%d, currentItem=[%d]",
+          [self indexForItem:endedPlayerItem],
+          [self debugNameForIndex:[self indexForItem:endedPlayerItem]], _index,
+          [self indexForItem:(IndexedPlayerItem *)_player.currentItem]);
 
     if (_loopMode == lmLoopOne) {
         [endedSource seek:kCMTimeZero];
@@ -1277,7 +1316,19 @@ static const BOOL DEBUG_LOG = NO;
                     [self startPreloadChain];
                 }
             } else if (!_enqueuedAll) {
-                [self enqueueFrom:_index];
+                // A plain advance leaves the queue already in the right order,
+                // so top it up instead of rebuilding it. enqueueFrom: removes
+                // and re-inserts every item behind the current one, and that
+                // churn lands while the new item is only tens of ms in — long
+                // enough for AVQueuePlayer to re-preroll it, which is audible
+                // on an item whose sound starts immediately. Only the preload
+                // chain can top up, so fall back when it is not running.
+                if (_preloadBufferDurationUs > 0 && _useLazyPreparation) {
+                    [self updateEndAction];
+                    [self startPreloadChain];
+                } else {
+                    [self enqueueFrom:_index];
+                }
             } else {
                 [self startPreloadChain];
             }
@@ -1367,6 +1418,17 @@ static const BOOL DEBUG_LOG = NO;
 
 - (void)abortExistingConnection:(BOOL)switchToIdle {
     [self sendError:@(ERROR_ABORT) errorMessage:@"Connection aborted" playerItem:nil switchToIdle:switchToIdle];
+}
+
+// Debug only: the file behind a source index, so a log window is self-marking.
+- (NSString *)debugNameForIndex:(int)index {
+    if (index < 0 || index >= (int)_indexedAudioSources.count) return @"?";
+    IndexedAudioSource *source = _indexedAudioSources[index];
+    if ([source respondsToSelector:@selector(uri)]) {
+        NSString *uri = [(id)source uri];
+        return [uri lastPathComponent] ?: uri;
+    }
+    return NSStringFromClass([source class]);
 }
 
 - (int)indexForItem:(IndexedPlayerItem *)playerItem {
