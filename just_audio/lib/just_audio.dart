@@ -1369,12 +1369,18 @@ class AudioPlayer {
   /// within [sequence].
   ///
   /// A `null` [position] seeks to the head of a live stream.
-  Future<void> seek(final Duration? position, {int? index}) async {
-    if (_disposed) return;
+  ///
+  /// Returns whether the platform applied the seek. Seeks that arrive while
+  /// the platform is idle or loading, and seeks superseded by a newer seek,
+  /// are dropped and return false. Note that the seek target is published
+  /// optimistically on [playbackEventStream] either way, so a false return
+  /// value is the only reliable signal that the seek did not land.
+  Future<bool> seek(final Duration? position, {int? index}) async {
+    if (_disposed) return false;
     _pluginLoadRequest?.resetInitialSeekValues();
     switch (processingState) {
       case ProcessingState.loading:
-        return;
+        return false;
       default:
         try {
           _seeking = true;
@@ -1390,11 +1396,12 @@ class AudioPlayer {
               PositionDiscontinuityReason.seek,
               prevPlaybackEvent,
               playbackEvent));
-          await (await _platform)
+          final response = await (await _platform)
               .seek(SeekRequest(position: position, index: index));
           if (playing && !_active) {
             _setPlatformActive(true)?.catchError((dynamic e) async => null);
           }
+          return response.applied;
         } finally {
           _seeking = false;
         }

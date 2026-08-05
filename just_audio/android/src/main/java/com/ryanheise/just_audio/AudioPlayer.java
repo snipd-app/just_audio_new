@@ -446,8 +446,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     private void completeSeek() {
         seekPos = null;
-        seekResult.success(new HashMap<String, Object>());
+        seekResult.success(seekResponse(true));
         seekResult = null;
+    }
+
+    private Map<String, Object> seekResponse(boolean applied) {
+        Map<String, Object> response = new HashMap<>();
+        response.put("applied", applied);
+        return response;
     }
 
     @Override
@@ -1132,7 +1138,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     public void seek(final long position, final Integer index, final Result result) {
         if (processingState == ProcessingState.idle || processingState == ProcessingState.loading) {
-            result.success(new HashMap<String, Object>());
+            result.success(seekResponse(false));
             return;
         }
         abortSeek();
@@ -1171,7 +1177,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     private void abortSeek() {
         if (seekResult != null) {
             try {
-                seekResult.success(new HashMap<String, Object>());
+                seekResult.success(seekResponse(false));
             } catch (RuntimeException e) {
                 // Result already sent
             }

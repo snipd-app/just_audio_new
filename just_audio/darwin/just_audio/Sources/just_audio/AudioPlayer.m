@@ -179,7 +179,7 @@ static const BOOL DEBUG_LOG = NO;
         } else if ([@"seek" isEqualToString:call.method]) {
             CMTime position = request[@"position"] == (id)[NSNull null] ? kCMTimePositiveInfinity : CMTimeMake([request[@"position"] longLongValue], 1000000);
             [self seek:position index:request[@"index"] completionHandler:^(BOOL finished) {
-                result(@{});
+                result(@{@"applied": @(finished)});
             }];
         } else if ([@"concatenatingInsertAll" isEqualToString:call.method]) {
             [self concatenatingInsertAll:(NSString *)request[@"id"] index:[request[@"index"] intValue] sources:(NSArray *)request[@"children"] shuffleOrder:(NSArray<NSNumber *> *)request[@"shuffleOrder"]];

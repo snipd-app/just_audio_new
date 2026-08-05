@@ -807,7 +807,16 @@ class SeekRequest {
 /// Information returned by the platform implementation after seeking to a
 /// position and index.
 class SeekResponse {
-  static SeekResponse fromMap(Map<dynamic, dynamic> map) => SeekResponse();
+  /// Whether the platform applied the seek. Platforms silently drop seeks
+  /// that arrive while they are idle or loading (and seeks superseded by a
+  /// newer seek); those report false so the caller can retry. Platforms that
+  /// don't report anything are assumed to have applied the seek.
+  final bool applied;
+
+  SeekResponse({this.applied = true});
+
+  static SeekResponse fromMap(Map<dynamic, dynamic> map) =>
+      SeekResponse(applied: map['applied'] as bool? ?? true);
 }
 
 /// Information communicated to the platform implementation when setting the
