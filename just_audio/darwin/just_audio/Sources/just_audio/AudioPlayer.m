@@ -14,6 +14,8 @@
 #define TREADMILL_SIZE 2
 #define ERROR_ABORT 10000000
 
+#define PLAYED_PAST_END_TOLERANCE 0.1
+
 static const BOOL DEBUG_LOG = NO;
 
 // TODO: Check for and report invalid state transitions.
@@ -46,6 +48,8 @@ static const BOOL DEBUG_LOG = NO;
     FlutterResult _loadResult;
     FlutterResult _playResult;
     id _timeObserver;
+    id _recoveryObserver;
+    int _playbackPositionRecoveredIndex;
     BOOL _automaticallyWaitsToMinimizeStalling;
     BOOL _allowsExternalPlayback;
     LoadControl *_loadControl;
@@ -89,6 +93,7 @@ static const BOOL DEBUG_LOG = NO;
     _orderInv = nil;
     _seekPos = kCMTimeInvalid;
     _timeObserver = 0;
+    _playbackPositionRecoveredIndex = -1;
     _updatePosition = 0;
     _updateTime = 0;
     _lastPosition = 0;
@@ -961,6 +966,11 @@ static const BOOL DEBUG_LOG = NO;
         //__weak __typeof__(self) weakSelf = self;
         //typeof(self) __weak weakSelf = self;
         __unsafe_unretained typeof(self) weakSelf = self;
+        _recoveryObserver = [_player addPeriodicTimeObserverForInterval:CMTimeMake(200, 1000)
+                                                              queue:nil
+                                                         usingBlock:^(CMTime time) {
+                                                             [weakSelf checkPlayedPastEnd];
+                                                         }];
         if (@available(macOS 10.12, iOS 10.0, *)) {}
         else {
             _timeObserver = [_player addPeriodicTimeObserverForInterval:CMTimeMake(200, 1000)
@@ -1025,6 +1035,41 @@ static const BOOL DEBUG_LOG = NO;
 - (void)onFailToComplete:(NSNotification *)notification {
     //IndexedPlayerItem *playerItem = (IndexedPlayerItem *)notification.object;
     //NSLog(@"onFailToComplete");
+}
+
+// Pauses and immediately resumes playback when the current item's position has
+// run past its own duration.
+//
+// AVQueuePlayer sometimes stops tracking an item's end: the clock goes on
+// advancing with nothing audible, the renderer never reports end of
+// stream, so DidPlayToEndTime is never posted and the queue never advances.
+// Playback stays there indefinitely, and a manual pause/play is the only thing
+// observed to get it moving again. Why the end is missed in the first place is
+// unknown, so this treats the symptom, not the cause.
+- (void)checkPlayedPastEnd {
+    if (!_playing || _player.rate == 0) return;
+    AVPlayerItem *item = _player.currentItem;
+    if (!item || item.status != AVPlayerItemStatusReadyToPlay) return;
+    // Once per current item; reset when the current item changes. Comparing
+    int index = [self indexForItem:(IndexedPlayerItem *)item];
+    if (index == _playbackPositionRecoveredIndex) return;
+
+    CMTime endTime = item.forwardPlaybackEndTime;
+    if (!CMTIME_IS_NUMERIC(endTime)) endTime = item.duration;
+    double end = CMTIME_IS_NUMERIC(endTime) ? CMTimeGetSeconds(endTime) : -1;
+    double position = CMTimeGetSeconds(item.currentTime);
+    if (end <= 0 || position <= end + PLAYED_PAST_END_TOLERANCE) return;
+
+    _playbackPositionRecoveredIndex = index;
+    float wanted = _speed;
+    _player.rate = 0;
+    // Restoring it in the same turn of the run loop collapses into a no-op; the
+    // transition has to be observable for the player to act on it.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf && strongSelf->_playing) strongSelf->_player.rate = wanted;
+    });
 }
 
 - (void)onComplete:(NSNotification *)notification {
@@ -1245,6 +1290,7 @@ static const BOOL DEBUG_LOG = NO;
                             _index,
                             (long)((IndexedPlayerItem *)change[NSKeyValueChangeNewKey]).status);
         IndexedPlayerItem *playerItem = (IndexedPlayerItem *)change[NSKeyValueChangeNewKey];
+        _playbackPositionRecoveredIndex = -1;
         //IndexedPlayerItem *oldPlayerItem = (IndexedPlayerItem *)change[NSKeyValueChangeOldKey];
         if (playerItem.status == AVPlayerItemStatusFailed) {
             if (DEBUG_LOG) NSLog(@"currentItem KVO: new current item [%d] is failed — calling sendErrorForItem",
@@ -1809,6 +1855,10 @@ static const BOOL DEBUG_LOG = NO;
     if (_timeObserver) {
         [_player removeTimeObserver:_timeObserver];
         _timeObserver = 0;
+    }
+    if (_recoveryObserver) {
+        [_player removeTimeObserver:_recoveryObserver];
+        _recoveryObserver = 0;
     }
     if (_indexedAudioSources) {
         for (int i = 0; i < [_indexedAudioSources count]; i++) {
