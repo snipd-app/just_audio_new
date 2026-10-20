@@ -15,6 +15,12 @@
 #define ERROR_ABORT 10000000
 
 #define PLAYED_PAST_END_TOLERANCE 0.1
+// Stuck, not starving, once this much media is loaded ahead; kick delays back off.
+#define STALL_KICK_MIN_BUFFER_MS 10000
+// A stalled player still flushes tens of ms when its clock blips; observer steps are 200 ms.
+#define STALL_PROGRESS_MIN_MS 150
+#define STALL_KICK_MAX 3
+static const long long kStallKickDelaysMs[STALL_KICK_MAX] = {5000, 15000, 45000};
 
 static const BOOL DEBUG_LOG = NO;
 
@@ -47,6 +53,11 @@ static const BOOL DEBUG_LOG = NO;
     FlutterResult _loadResult;
     FlutterResult _playResult;
     id _recoveryObserver;
+    NSTimer *_stallTimer;
+    CMTimebaseRef _observedTimebase;
+    int _stallKicks;
+    long long _stallNextKickAt;
+    CMTime _lastObservedTime;
     int _playbackPositionRecoveredIndex;
     BOOL _automaticallyWaitsToMinimizeStalling;
     BOOL _allowsExternalPlayback;
@@ -90,6 +101,11 @@ static const BOOL DEBUG_LOG = NO;
     _order = nil;
     _orderInv = nil;
     _seekPos = kCMTimeInvalid;
+    _stallTimer = nil;
+    _observedTimebase = NULL;
+    _stallKicks = 0;
+    _stallNextKickAt = 0;
+    _lastObservedTime = kCMTimeInvalid;
     _playbackPositionRecoveredIndex = -1;
     _updatePosition = 0;
     _updateTime = 0;
@@ -339,10 +355,15 @@ static const BOOL DEBUG_LOG = NO;
     if (_processingState != psIdle) {
         //NSLog(@"ENTER BUFFERING: %@", reason);
         _processingState = psBuffering;
+        _lastObservedTime = kCMTimeInvalid;
+        if (_playing) {
+            [self startStallTimer];
+        }
     }
 }
 
 - (void)leaveBuffering:(NSString *)reason {
+    [self stopStallTimer];
     if (_processingState == psBuffering || _processingState == psLoading) {
         //NSLog(@"LEAVE BUFFERING: %@", reason);
         _processingState = psReady;
@@ -928,6 +949,7 @@ static const BOOL DEBUG_LOG = NO;
         _recoveryObserver = [_player addPeriodicTimeObserverForInterval:CMTimeMake(200, 1000)
                                                               queue:nil
                                                          usingBlock:^(CMTime time) {
+                                                             [weakSelf onPlayerTimeChange:time];
                                                              [weakSelf checkPlayedPastEnd];
                                                          }];
     }
@@ -1113,6 +1135,7 @@ static const BOOL DEBUG_LOG = NO;
                 if (playerItem != _player.currentItem) {
                     return;
                 }
+                [self observeTimebaseOfItem:playerItem];
                 // Detect buffering in different ways depending on whether we're playing
                 if (_playing) {
                     if (_player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate) {
@@ -1167,7 +1190,8 @@ static const BOOL DEBUG_LOG = NO;
         if (CMTIME_IS_VALID(_seekPos)) return;
         // Detect buffering in different ways depending on whether we're playing
         if (_playing) {
-            // We handle this with timeControlStatus instead.
+            // These flags contradict a frozen clock on device; the item's timebase
+            // (onTimebaseRateChanged:) decides instead.
         } else {
             if (playerItem.playbackBufferEmpty) {
                 [self enterBuffering:@"!playing, playbackBufferEmpty"];
@@ -1201,7 +1225,9 @@ static const BOOL DEBUG_LOG = NO;
                 }
                 break;
             case AVPlayerTimeControlStatusPlaying:
-                [self leaveBuffering:@"timeControlStatus"];
+                if (_processingState != psBuffering || [self isClockPlayingMedia]) {
+                    [self leaveBuffering:@"timeControlStatus"];
+                }
                 [self updatePosition];
                 [self broadcastPlaybackEvent];
                 break;
@@ -1231,42 +1257,7 @@ static const BOOL DEBUG_LOG = NO;
         }
         //NSLog(@"currentItem changed. _index=%d", _index);
         _bufferUnconfirmed = YES;
-        // If we've skipped or transitioned to a new item and we're not
-        // currently in the middle of a seek
-        /* if (CMTIME_IS_INVALID(_seekPos) && playerItem.status == AVPlayerItemStatusReadyToPlay) { */
-        /*     [self updatePosition]; */
-        /*     IndexedAudioSource *source = playerItem.audioSource; */
-        /*     // We should already be at position zero but for */
-        /*     // ClippingAudioSource it might be off by some milliseconds so we */
-        /*     // consider anything <= 100 as close enough. */
-        /*     if ((int)(1000 * CMTimeGetSeconds(source.position)) > 100) { */
-        /*         NSLog(@"On currentItem change, seeking back to zero"); */
-        /*         BOOL shouldResumePlayback = NO; */
-        /*         AVPlayerActionAtItemEnd originalEndAction = _player.actionAtItemEnd; */
-        /*         if (_playing && CMTimeGetSeconds(CMTimeSubtract(source.position, source.duration)) >= 0) { */
-        /*             NSLog(@"Need to pause while rewinding because we're at the end"); */
-        /*             shouldResumePlayback = YES; */
-        /*             _player.actionAtItemEnd = AVPlayerActionAtItemEndPause; */
-        /*             [_player pause]; */
-        /*         } */
-        /*         [self enterBuffering:@"currentItem changed, seeking"]; */
-        /*         [self updatePosition]; */
-        /*         [self broadcastPlaybackEvent]; */
-        /*         __weak __typeof__(self) weakSelf = self; */
-        /*         [source seek:kCMTimeZero completionHandler:^(BOOL finished) { */
-        /*             [weakSelf leaveBuffering:@"currentItem changed, finished seek"]; */
-        /*             [weakSelf updatePosition]; */
-        /*             [weakSelf broadcastPlaybackEvent]; */
-        /*             if (shouldResumePlayback) { */
-        /*                 weakSelf.player.actionAtItemEnd = originalEndAction; */
-        /*                 // TODO: This logic is almost duplicated in seek. See if we can reuse this code. */
-        /*                 weakSelf.player.rate = weakSelf.speed; */
-        /*             } */
-        /*         }]; */
-        /*     } else { */
-        /*         // Already at zero, no need to seek. */
-        /*     } */
-        /* } */
+        [self observeTimebaseOfItem:playerItem];
 
         if (_justAdvanced) {
             IndexedAudioSource *audioSource = playerItem.audioSource;
@@ -1693,7 +1684,8 @@ static const BOOL DEBUG_LOG = NO;
         [_indexedAudioSources[_index] seek:position completionHandler:^(BOOL finished) {
             [self updatePosition];
             if (self->_playing) {
-                // If playing, buffering will be detected by timeControlStatus.
+                // If playing, buffering will be detected by timeControlStatus
+                // or the item's timebase.
                 // NOTE: Re-enable this line only after figuring out how to
                 // detect buffering when buffered audio is not immediately
                 // available.
@@ -1766,9 +1758,163 @@ static const BOOL DEBUG_LOG = NO;
         _player = nil;
     }
     // Untested:
+    [self stopStallTimer];
+    [self stopObservingTimebase];
     [_eventChannel dispose];
     [_dataEventChannel dispose];
     [_methodChannel setMethodCallHandler:nil];
+}
+
+#pragma mark - Stall detection and self-healing
+
+// The item's timebase is the only playback signal that never lies during a stall.
+- (void)onTimebaseRateChanged:(NSNotification *)notification {
+    // Posted from a Core Media thread that holds the player lock until the
+    // observer returns, so nothing may touch the item here: hop and return.
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self onTimebaseRateChanged:notification]; });
+        return;
+    }
+    if ((__bridge CMTimebaseRef)notification.object != _observedTimebase) return;
+
+    double effectiveRate = [self effectiveTimebaseRate];
+
+    if (!_playing || [self isSeeking]) return;
+
+    if (effectiveRate > 0 && _processingState == psBuffering) {
+        // Without media ahead, onPlayerTimeChange: ends buffering once the position moves.
+        if ([self isClockPlayingMedia]) {
+            [self leaveBuffering:@"timebase running"];
+            [self updatePosition];
+            [self broadcastPlaybackEvent];
+        }
+    } else if (effectiveRate == 0 && _processingState == psReady && _player.rate != 0) {
+        [self enterBuffering:@"timebase stopped"];
+        [self updatePosition];
+        [self broadcastPlaybackEvent];
+    }
+}
+
+// A full observer step later than the last time is proof that audio is advancing.
+- (void)onPlayerTimeChange:(CMTime)time {
+    if (_playing && _processingState == psBuffering && ![self isSeeking] &&
+        CMTIME_IS_VALID(_lastObservedTime)) {
+        double stepMs = 1000 * CMTimeGetSeconds(CMTimeSubtract(time, _lastObservedTime));
+        if (stepMs >= STALL_PROGRESS_MIN_MS) {
+            [self leaveBuffering:@"progress observed"];
+            [self updatePosition];
+            [self broadcastPlaybackEvent];
+        }
+    }
+    _lastObservedTime = time;
+}
+
+- (void)observeTimebaseOfItem:(AVPlayerItem *)item {
+    CMTimebaseRef timebase = item.timebase;
+    if (timebase == _observedTimebase) return;
+    [self stopObservingTimebase];
+    if (!timebase) return;
+    _observedTimebase = (CMTimebaseRef)CFRetain(timebase);
+    // CMNotificationCenter is not public on iOS; the timebase posts to the default
+    // center. Not addObserverForName:queue: — Foundation makes the poster wait for
+    // the queued block, which deadlocks against the lock Core Media holds while posting.
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onTimebaseRateChanged:)
+                                                 name:(__bridge NSString *)kCMTimebaseNotification_EffectiveRateChanged
+                                               object:(__bridge id)_observedTimebase];
+}
+
+- (void)stopObservingTimebase {
+    if (!_observedTimebase) return;
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:(__bridge NSString *)kCMTimebaseNotification_EffectiveRateChanged
+                                                  object:(__bridge id)_observedTimebase];
+    CFRelease(_observedTimebase);
+    _observedTimebase = NULL;
+}
+
+// What kCMTimebaseNotification_EffectiveRateChanged reports; not the requested rate.
+- (BOOL)isSeeking {
+    return CMTIME_IS_VALID(_seekPos);
+}
+
+- (double)effectiveTimebaseRate {
+    CMTimebaseRef timebase = _player.currentItem.timebase;
+    return timebase ? CMTimebaseGetEffectiveRate(timebase) : 0;
+}
+
+// A stall can report "playing" with a stopped clock, or run the clock with nothing to play.
+- (BOOL)isClockPlayingMedia {
+    return [self effectiveTimebaseRate] > 0 && [self loadedMediaAheadMs] > 0;
+}
+
+// From the range containing the playhead; the buffered position is the end of the last range.
+- (int)loadedMediaAheadMs {
+    AVPlayerItem *item = _player.currentItem;
+    if (!item) return 0;
+    CMTime now = item.currentTime;
+    CMTime slack = CMTimeMakeWithSeconds(0.5, 1000);
+    for (NSValue *value in item.loadedTimeRanges) {
+        CMTimeRange range = [value CMTimeRangeValue];
+        CMTime end = CMTimeRangeGetEnd(range);
+        if (CMTimeCompare(CMTimeAdd(now, slack), range.start) >= 0 && CMTimeCompare(now, end) < 0) {
+            int ms = (int)(1000 * CMTimeGetSeconds(CMTimeSubtract(end, now)));
+            return ms > 0 ? ms : 0;
+        }
+    }
+    return 0;
+}
+
+// AVPlayer does not resume a stalled progressive stream by itself once data flows again.
+- (void)startStallTimer {
+    if (_stallTimer) return;
+
+    _stallKicks = 0;
+    _stallNextKickAt = 0;
+    __weak typeof(self) weakSelf = self;
+
+    _stallTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        [weakSelf checkForStuckPlayback];
+    }];
+    _stallTimer.tolerance = 0.25;
+}
+
+- (void)stopStallTimer {
+    [_stallTimer invalidate];
+    _stallTimer = nil;
+    _stallNextKickAt = 0;
+}
+
+- (void)checkForStuckPlayback {
+    if (!_playing) {
+        [self stopStallTimer];
+        return;
+    }
+    // rate == 0 means the system paused the player (interruption), not a stall.
+    if ([self isSeeking] || _processingState != psBuffering || _player.rate == 0 ||
+        [self effectiveTimebaseRate] > 0 || _stallKicks >= STALL_KICK_MAX) {
+        return;
+    }
+
+    if ([self loadedMediaAheadMs] < STALL_KICK_MIN_BUFFER_MS) {
+        // Starving, not stuck: a kick would only stall again.
+        _stallNextKickAt = 0;
+        return;
+    }
+
+    long long now = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+    if (_stallNextKickAt == 0) {
+        // Data just arrived: give AVPlayer one grace period to resume on its own.
+        _stallNextKickAt = now + kStallKickDelaysMs[_stallKicks];
+    } else if (now >= _stallNextKickAt) {
+        _stallKicks++;
+        _stallNextKickAt = _stallKicks < STALL_KICK_MAX ? now + kStallKickDelaysMs[_stallKicks] : 0;
+        [self kickPlayback];
+    }
+}
+
+// playImmediatelyAtRate: bypasses AVPlayer's stall-minimization wait.
+- (void)kickPlayback {
+    [_player playImmediatelyAtRate:_speed];
 }
 
 @end
