@@ -72,22 +72,14 @@
         AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL URLWithString:uri] options:assetOptions];
         item = [[IndexedPlayerItem alloc] initWithAsset:asset];
     }
-    if (@available(macOS 10.13, iOS 11.0, *)) {
-        // This does the best at reducing distortion on voice with speeds below 1.0
-        item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmTimeDomain;
+    // This does the best at reducing distortion on voice with speeds below 1.0
+    item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmTimeDomain;
+    if (_loadControl.preferredForwardBufferDuration != (id)[NSNull null]) {
+        item.preferredForwardBufferDuration = (double)([_loadControl.preferredForwardBufferDuration longLongValue]/1000) / 1000.0;
     }
-    if (@available(macOS 10.12, iOS 10.0, *)) {
-        if (_loadControl.preferredForwardBufferDuration != (id)[NSNull null]) {
-            item.preferredForwardBufferDuration = (double)([_loadControl.preferredForwardBufferDuration longLongValue]/1000) / 1000.0;
-        }
-    }
-    if (@available(iOS 9.0, macOS 10.11, *)) {
-        item.canUseNetworkResourcesForLiveStreamingWhilePaused = _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused;
-    }
-    if (@available(iOS 8.0, macOS 10.10, *)) {
-        if (_loadControl.preferredPeakBitRate != (id)[NSNull null]) {
-            item.preferredPeakBitRate = [_loadControl.preferredPeakBitRate doubleValue];
-        }
+    item.canUseNetworkResourcesForLiveStreamingWhilePaused = _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused;
+    if (_loadControl.preferredPeakBitRate != (id)[NSNull null]) {
+        item.preferredPeakBitRate = [_loadControl.preferredPeakBitRate doubleValue];
     }
 
     return item;
@@ -95,34 +87,28 @@
 
 // Not used. XXX: Remove?
 - (void)applyPreferredForwardBufferDuration {
-    if (@available(macOS 10.12, iOS 10.0, *)) {
-        if (_loadControl.preferredForwardBufferDuration != (id)[NSNull null]) {
-            double value = (double)([_loadControl.preferredForwardBufferDuration longLongValue]/1000) / 1000.0;
-            _playerItem.preferredForwardBufferDuration = value;
-            if (_playerItem2) {
-                _playerItem2.preferredForwardBufferDuration = value;
-            }
+    if (_loadControl.preferredForwardBufferDuration != (id)[NSNull null]) {
+        double value = (double)([_loadControl.preferredForwardBufferDuration longLongValue]/1000) / 1000.0;
+        _playerItem.preferredForwardBufferDuration = value;
+        if (_playerItem2) {
+            _playerItem2.preferredForwardBufferDuration = value;
         }
     }
 }
 
 - (void)applyCanUseNetworkResourcesForLiveStreamingWhilePaused {
-    if (@available(iOS 9.0, macOS 10.11, *)) {
-        _playerItem.canUseNetworkResourcesForLiveStreamingWhilePaused = _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused;
-        if (_playerItem2) {
-            _playerItem2.canUseNetworkResourcesForLiveStreamingWhilePaused = _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused;
-        }
+    _playerItem.canUseNetworkResourcesForLiveStreamingWhilePaused = _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused;
+    if (_playerItem2) {
+        _playerItem2.canUseNetworkResourcesForLiveStreamingWhilePaused = _loadControl.canUseNetworkResourcesForLiveStreamingWhilePaused;
     }
 }
 
 - (void)applyPreferredPeakBitRate {
-    if (@available(iOS 8.0, macOS 10.10, *)) {
-        if (_loadControl.preferredPeakBitRate != (id)[NSNull null]) {
-            double value = [_loadControl.preferredPeakBitRate doubleValue];
-            _playerItem.preferredPeakBitRate = value;
-            if (_playerItem2) {
-                _playerItem2.preferredPeakBitRate = value;
-            }
+    if (_loadControl.preferredPeakBitRate != (id)[NSNull null]) {
+        double value = [_loadControl.preferredPeakBitRate doubleValue];
+        _playerItem.preferredPeakBitRate = value;
+        if (_playerItem2) {
+            _playerItem2.preferredPeakBitRate = value;
         }
     }
 }

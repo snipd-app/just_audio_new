@@ -40,14 +40,12 @@ static const BOOL DEBUG_LOG = NO;
     BOOL _shuffleModeEnabled;
     long long _updateTime;
     int _updatePosition;
-    int _lastPosition;
     int _bufferedPosition;
     // Set when the current item hasn't been played yet so we aren't sure whether sufficient audio has been buffered.
     BOOL _bufferUnconfirmed;
     CMTime _seekPos;
     FlutterResult _loadResult;
     FlutterResult _playResult;
-    id _timeObserver;
     id _recoveryObserver;
     int _playbackPositionRecoveredIndex;
     BOOL _automaticallyWaitsToMinimizeStalling;
@@ -92,11 +90,9 @@ static const BOOL DEBUG_LOG = NO;
     _order = nil;
     _orderInv = nil;
     _seekPos = kCMTimeInvalid;
-    _timeObserver = 0;
     _playbackPositionRecoveredIndex = -1;
     _updatePosition = 0;
     _updateTime = 0;
-    _lastPosition = 0;
     _bufferedPosition = 0;
     _bufferUnconfirmed = NO;
     _playing = NO;
@@ -337,39 +333,6 @@ static const BOOL DEBUG_LOG = NO;
     [self updateOrder];
     [self enqueueFrom:[self indexForItem:(IndexedPlayerItem *)_player.currentItem]];
     [self broadcastPlaybackEvent];
-}
-
-- (void)checkForDiscontinuity {
-    if (!_playing || CMTIME_IS_VALID(_seekPos) || _processingState == psCompleted) return;
-    int position = [self getCurrentPosition];
-    // The restart signature: still on the same item, but the clock jumped back.
-    if (DEBUG_LOG && position + 200 < _lastPosition) {
-        NSLog(@"!!!! POSITION WENT BACKWARDS on item [%d]: %dms -> %dms (item restarted?)",
-              _index, _lastPosition, position);
-    }
-    if (_processingState == psBuffering) {
-        if (position > _lastPosition) {
-            [self leaveBuffering:@"stall ended"];
-            [self updatePosition];
-            [self broadcastPlaybackEvent];
-        }
-    } else {
-        long long now = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
-        long long timeSinceLastUpdate = now - _updateTime;
-        long long expectedPosition = _updatePosition + (long long)(timeSinceLastUpdate * _player.rate);
-        long long drift = position - expectedPosition;
-        //NSLog(@"position: %d, drift: %lld", position, drift);
-        // Update if we've drifted or just started observing
-        if (_updateTime == 0L) {
-            [self broadcastPlaybackEvent];
-        } else if (drift < -100) {
-            [self enterBuffering:@"stalling"];
-            //NSLog(@"Drift: %lld", drift);
-            [self updatePosition];
-            [self broadcastPlaybackEvent];
-        }
-    }
-    _lastPosition = position;
 }
 
 - (void)enterBuffering:(NSString *)reason {
@@ -947,17 +910,13 @@ static const BOOL DEBUG_LOG = NO;
     // Set up an empty player
     if (!_player) {
         _player = [[AVQueuePlayer alloc] initWithItems:@[]];
-        if (@available(macOS 10.12, iOS 10.0, *)) {
-            _player.automaticallyWaitsToMinimizeStalling = _automaticallyWaitsToMinimizeStalling;
-            // TODO: Remove these observers in dispose.
-            [_player addObserver:self
-                      forKeyPath:@"timeControlStatus"
-                         options:NSKeyValueObservingOptionNew
-                         context:nil];
-        }
-        if (@available(macOS 10.11, iOS 6.0, *)) {
-            _player.allowsExternalPlayback = _allowsExternalPlayback;
-        }
+        _player.automaticallyWaitsToMinimizeStalling = _automaticallyWaitsToMinimizeStalling;
+        // TODO: Remove these observers in dispose.
+        [_player addObserver:self
+                  forKeyPath:@"timeControlStatus"
+                     options:NSKeyValueObservingOptionNew
+                     context:nil];
+        _player.allowsExternalPlayback = _allowsExternalPlayback;
         [_player addObserver:self
                   forKeyPath:@"currentItem"
                      options:NSKeyValueObservingOptionNew
@@ -971,15 +930,6 @@ static const BOOL DEBUG_LOG = NO;
                                                          usingBlock:^(CMTime time) {
                                                              [weakSelf checkPlayedPastEnd];
                                                          }];
-        if (@available(macOS 10.12, iOS 10.0, *)) {}
-        else {
-            _timeObserver = [_player addPeriodicTimeObserverForInterval:CMTimeMake(200, 1000)
-                                                                  queue:nil
-                                                             usingBlock:^(CMTime time) {
-                                                                 [weakSelf checkForDiscontinuity];
-                                                             }
-            ];
-        }
     }
     // Initialise the AVQueuePlayer with items.
     [self enqueueFrom:_index];
@@ -1165,28 +1115,12 @@ static const BOOL DEBUG_LOG = NO;
                 }
                 // Detect buffering in different ways depending on whether we're playing
                 if (_playing) {
-                    if (@available(macOS 10.12, iOS 10.0, *)) {
-                        if (_player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate) {
-                            [self enterBuffering:@"ready to play: playing, waitingToPlay"];
-                        } else {
-                            [self leaveBuffering:@"ready to play: playing, !waitingToPlay"];
-                        }
-                        [self updatePosition];
+                    if (_player.timeControlStatus == AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate) {
+                        [self enterBuffering:@"ready to play: playing, waitingToPlay"];
                     } else {
-                        // If this happens when we're playing, check whether buffer is confirmed
-                        if (_bufferUnconfirmed && !_player.currentItem.playbackBufferFull) {
-                            // Stay in bufering - XXX Test
-                            [self enterBuffering:@"ready to play: playing, bufferUnconfirmed && !playbackBufferFull"];
-                        } else {
-                            if (_player.currentItem.playbackBufferEmpty) {
-                                // !_player.currentItem.playbackLikelyToKeepUp;
-                                [self enterBuffering:@"ready to play: playing, playbackBufferEmpty"];
-                            } else {
-                                [self leaveBuffering:@"ready to play: playing, !playbackBufferEmpty"];
-                            }
-                            [self updatePosition];
-                        }
+                        [self leaveBuffering:@"ready to play: playing, !waitingToPlay"];
                     }
+                    [self updatePosition];
                 } else {
                     if (_player.currentItem.playbackBufferEmpty) {
                         [self enterBuffering:@"ready to play: !playing, playbackBufferEmpty"];
@@ -1233,17 +1167,7 @@ static const BOOL DEBUG_LOG = NO;
         if (CMTIME_IS_VALID(_seekPos)) return;
         // Detect buffering in different ways depending on whether we're playing
         if (_playing) {
-            if (@available(macOS 10.12, iOS 10.0, *)) {
-                // We handle this with timeControlStatus instead.
-            } else {
-                if (_bufferUnconfirmed && playerItem.playbackBufferFull) {
-                    _bufferUnconfirmed = NO;
-                    [self leaveBuffering:@"playing, _bufferUnconfirmed && playbackBufferFull"];
-                    [self updatePosition];
-                    //NSLog(@"Buffering confirmed! leaving buffering");
-                    [self broadcastPlaybackEvent];
-                }
-            }
+            // We handle this with timeControlStatus instead.
         } else {
             if (playerItem.playbackBufferEmpty) {
                 [self enterBuffering:@"!playing, playbackBufferEmpty"];
@@ -1257,32 +1181,30 @@ static const BOOL DEBUG_LOG = NO;
         }
     /* } else if ([keyPath isEqualToString:@"playbackLikelyToKeepUp"]) { */
     } else if ([keyPath isEqualToString:@"timeControlStatus"]) {
-        if (@available(macOS 10.12, iOS 10.0, *)) {
-            AVPlayerTimeControlStatus status = AVPlayerTimeControlStatusPaused;
-            NSNumber *statusNumber = change[NSKeyValueChangeNewKey];
-            if ([statusNumber isKindOfClass:[NSNumber class]]) {
-                status = statusNumber.intValue;
-            }
-            switch (status) {
-                case AVPlayerTimeControlStatusPaused:
-                    //NSLog(@"AVPlayerTimeControlStatusPaused");
-                    break;
-                case AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate:
-                    //NSLog(@"AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate");
-                    if (_processingState != psCompleted) {
-                        [self enterBuffering:@"timeControlStatus"];
-                        [self updatePosition];
-                        [self broadcastPlaybackEvent];
-                    } else {
-                        //NSLog(@"Ignoring wait signal because we reached the end");
-                    }
-                    break;
-                case AVPlayerTimeControlStatusPlaying:
-                    [self leaveBuffering:@"timeControlStatus"];
+        AVPlayerTimeControlStatus status = AVPlayerTimeControlStatusPaused;
+        NSNumber *statusNumber = change[NSKeyValueChangeNewKey];
+        if ([statusNumber isKindOfClass:[NSNumber class]]) {
+            status = statusNumber.intValue;
+        }
+        switch (status) {
+            case AVPlayerTimeControlStatusPaused:
+                //NSLog(@"AVPlayerTimeControlStatusPaused");
+                break;
+            case AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate:
+                //NSLog(@"AVPlayerTimeControlStatusWaitingToPlayAtSpecifiedRate");
+                if (_processingState != psCompleted) {
+                    [self enterBuffering:@"timeControlStatus"];
                     [self updatePosition];
                     [self broadcastPlaybackEvent];
-                    break;
-            }
+                } else {
+                    //NSLog(@"Ignoring wait signal because we reached the end");
+                }
+                break;
+            case AVPlayerTimeControlStatusPlaying:
+                [self leaveBuffering:@"timeControlStatus"];
+                [self updatePosition];
+                [self broadcastPlaybackEvent];
+                break;
         }
     } else if ([keyPath isEqualToString:@"currentItem"] && _player.currentItem) {
         if (DEBUG_LOG) NSLog(@"currentItem KVO -> new item [%d], _index=%d, status=%ld",
@@ -1507,13 +1429,6 @@ static const BOOL DEBUG_LOG = NO;
     _playing = YES;
     _player.rate = _speed;
     [self updatePosition];
-    if (@available(macOS 10.12, iOS 10.0, *)) {}
-    else {
-        if (_bufferUnconfirmed && !_player.currentItem.playbackBufferFull) {
-            [self enterBuffering:@"play, _bufferUnconfirmed && !playbackBufferFull"];
-            [self broadcastPlaybackEvent];
-        }
-    }
 }
 
 - (void)pause {
@@ -1657,10 +1572,8 @@ static const BOOL DEBUG_LOG = NO;
 
 - (void)setAutomaticallyWaitsToMinimizeStalling:(bool)automaticallyWaitsToMinimizeStalling {
     _automaticallyWaitsToMinimizeStalling = automaticallyWaitsToMinimizeStalling;
-    if (@available(macOS 10.12, iOS 10.0, *)) {
-        if(_player) {
-            _player.automaticallyWaitsToMinimizeStalling = automaticallyWaitsToMinimizeStalling;
-        }
+    if(_player) {
+        _player.automaticallyWaitsToMinimizeStalling = automaticallyWaitsToMinimizeStalling;
     }
 }
 
@@ -1682,10 +1595,8 @@ static const BOOL DEBUG_LOG = NO;
 
 - (void)setAllowsExternalPlayback:(BOOL)allowsExternalPlayback {
     _allowsExternalPlayback = allowsExternalPlayback;
-    if (@available(macOS 10.11, iOS 6.0, *)) {
-        if (_player) {
-            _player.allowsExternalPlayback = allowsExternalPlayback;
-        }
+    if (_player) {
+        _player.allowsExternalPlayback = allowsExternalPlayback;
     }
 }
 
@@ -1734,18 +1645,8 @@ static const BOOL DEBUG_LOG = NO;
                 [self updatePosition];
                 [self broadcastPlaybackEvent];
                 [source seek:position completionHandler:^(BOOL finished) {
-                    if (@available(macOS 10.12, iOS 10.0, *)) {
-                        if (self->_playing) {
-                            // Handled by timeControlStatus
-                        } else {
-                            if (self->_bufferUnconfirmed && !self->_player.currentItem.playbackBufferFull) {
-                                // Stay in buffering
-                            } else if (source.playerItem.status == AVPlayerItemStatusReadyToPlay) {
-                                [self leaveBuffering:@"seek to index finished, (!bufferUnconfirmed || playbackBufferFull) && ready to play"];
-                                [self updatePosition];
-                                [self broadcastPlaybackEvent];
-                            }
-                        }
+                    if (self->_playing) {
+                        // Handled by timeControlStatus
                     } else {
                         if (self->_bufferUnconfirmed && !self->_player.currentItem.playbackBufferFull) {
                             // Stay in buffering
@@ -1767,15 +1668,11 @@ static const BOOL DEBUG_LOG = NO;
             } else {
                 _seekPos = kCMTimeInvalid;
                 if (_playing) {
-                    if (@available(iOS 10.0, *)) {
-                        // NOTE: Re-enable this line only after figuring out
-                        // how to detect buffering when buffered audio is not
-                        // immediately available.
-                        //[_player playImmediatelyAtRate:_speed];
-                        _player.rate = _speed;
-                    } else {
-                        _player.rate = _speed;
-                    }
+                    // NOTE: Re-enable this line only after figuring out
+                    // how to detect buffering when buffered audio is not
+                    // immediately available.
+                    //[_player playImmediatelyAtRate:_speed];
+                    _player.rate = _speed;
                 }
                 [self broadcastPlaybackEvent];
                 completionHandler(YES);
@@ -1796,18 +1693,12 @@ static const BOOL DEBUG_LOG = NO;
         [_indexedAudioSources[_index] seek:position completionHandler:^(BOOL finished) {
             [self updatePosition];
             if (self->_playing) {
-                // If playing, buffering will be detected either by:
-                // 1. checkForDiscontinuity
-                // 2. timeControlStatus
-                if (@available(iOS 10.0, *)) {
-                    // NOTE: Re-enable this line only after figuring out how to
-                    // detect buffering when buffered audio is not immediately
-                    // available.
-                    //[_player playImmediatelyAtRate:_speed];
-                    self->_player.rate = self->_speed;
-                } else {
-                    self->_player.rate = self->_speed;
-                }
+                // If playing, buffering will be detected by timeControlStatus.
+                // NOTE: Re-enable this line only after figuring out how to
+                // detect buffering when buffered audio is not immediately
+                // available.
+                //[_player playImmediatelyAtRate:_speed];
+                self->_player.rate = self->_speed;
             } else {
                 // If not playing, there is no reliable way to detect
                 // when buffering has completed, so we use
@@ -1852,10 +1743,6 @@ static const BOOL DEBUG_LOG = NO;
         // NSInternalInconsistencyException: 'Sending a message before the FlutterEngine has been run.'
         //[self broadcastPlaybackEvent];
     }
-    if (_timeObserver) {
-        [_player removeTimeObserver:_timeObserver];
-        _timeObserver = 0;
-    }
     if (_recoveryObserver) {
         [_player removeTimeObserver:_recoveryObserver];
         _recoveryObserver = 0;
@@ -1875,9 +1762,7 @@ static const BOOL DEBUG_LOG = NO;
     _errorsPerItem = nil;
     if (_player) {
         [_player removeObserver:self forKeyPath:@"currentItem"];
-        if (@available(macOS 10.12, iOS 10.0, *)) {
-            [_player removeObserver:self forKeyPath:@"timeControlStatus"];
-        }
+        [_player removeObserver:self forKeyPath:@"timeControlStatus"];
         _player = nil;
     }
     // Untested:
