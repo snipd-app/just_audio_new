@@ -1771,11 +1771,17 @@ static const BOOL DEBUG_LOG = NO;
 - (void)onTimebaseRateChanged:(NSNotification *)notification {
     // Posted from a Core Media thread that holds the player lock until the
     // observer returns, so nothing may touch the item here: hop and return.
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [self onTimebaseRateChanged:notification]; });
-        return;
+    // Only the raw pointer may hop: the notification doesn't keep the timebase alive.
+    CMTimebaseRef timebase = (__bridge CMTimebaseRef)notification.object;
+    if ([NSThread isMainThread]) {
+        [self onTimebaseRateChangedOf:timebase];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self onTimebaseRateChangedOf:timebase]; });
     }
-    if ((__bridge CMTimebaseRef)notification.object != _observedTimebase) return;
+}
+
+- (void)onTimebaseRateChangedOf:(CMTimebaseRef)timebase {
+    if (timebase != _observedTimebase) return;
 
     double effectiveRate = [self effectiveTimebaseRate];
 
