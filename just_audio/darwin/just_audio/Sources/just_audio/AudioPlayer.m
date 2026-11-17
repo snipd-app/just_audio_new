@@ -421,6 +421,8 @@ static const BOOL DEBUG_LOG = NO;
             @"updatePosition": @((long long)1000 * _updatePosition),
             @"updateTime": @(_updateTime),
             @"bufferedPosition": @((long long)1000 * [self getBufferedPosition]),
+            @"bufferedAhead": @((long long)1000 * [self indexedBufferedAheadMs]),
+            @"hasBuffered": @([self hasIndexedItemBuffered]),
             @"icyMetadata": _icyMetadata,
             @"duration": @([self getDurationMicroseconds]),
             @"currentIndex": @(_index),
@@ -1850,12 +1852,26 @@ static const BOOL DEBUG_LOG = NO;
 
 // A stall can report "playing" with a stopped clock, or run the clock with nothing to play.
 - (BOOL)isClockPlayingMedia {
-    return [self effectiveTimebaseRate] > 0 && [self loadedMediaAheadMs] > 0;
+    return [self effectiveTimebaseRate] > 0 && [self bufferedAheadMs] > 0;
 }
 
 // From the range containing the playhead; the buffered position is the end of the last range.
-- (int)loadedMediaAheadMs {
-    AVPlayerItem *item = _player.currentItem;
+- (int)bufferedAheadMs {
+    return [self bufferedAheadMsForItem:_player.currentItem];
+}
+
+// _index can already point at an item AVQueuePlayer has not made current yet.
+- (int)indexedBufferedAheadMs {
+    if (_index < 0 || _index >= (int)_indexedAudioSources.count) return 0;
+    return [self bufferedAheadMsForItem:_indexedAudioSources[_index].playerItem];
+}
+
+- (BOOL)hasIndexedItemBuffered {
+    if (_index < 0 || _index >= (int)_indexedAudioSources.count) return NO;
+    return _indexedAudioSources[_index].playerItem.status == AVPlayerItemStatusReadyToPlay;
+}
+
+- (int)bufferedAheadMsForItem:(AVPlayerItem *)item {
     if (!item) return 0;
     CMTime now = item.currentTime;
     CMTime slack = CMTimeMakeWithSeconds(0.5, 1000);
@@ -1901,7 +1917,7 @@ static const BOOL DEBUG_LOG = NO;
         return;
     }
 
-    if ([self loadedMediaAheadMs] < STALL_KICK_MIN_BUFFER_MS) {
+    if ([self bufferedAheadMs] < STALL_KICK_MIN_BUFFER_MS) {
         // Starving, not stuck: a kick would only stall again.
         _stallNextKickAt = 0;
         return;

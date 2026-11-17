@@ -305,6 +305,8 @@ class PlaybackEventMessage {
   final DateTime updateTime;
   final Duration updatePosition;
   final Duration bufferedPosition;
+  final Duration bufferedAhead;
+  final bool hasBuffered;
   final Duration? duration;
   final IcyMetadataMessage? icyMetadata;
   final int? currentIndex;
@@ -326,6 +328,8 @@ class PlaybackEventMessage {
     required this.androidAudioSessionId,
     this.errorCode,
     this.errorMessage,
+    this.bufferedAhead = Duration.zero,
+    this.hasBuffered = true,
     this.bufferedPositionPerIndex = const [],
     this.loadedDurationPerIndex = const [],
     this.errorsPerItem = const [],
@@ -351,6 +355,9 @@ class PlaybackEventMessage {
         androidAudioSessionId: map['androidAudioSessionId'] as int?,
         errorCode: map['errorCode'] as int?,
         errorMessage: map['errorMessage'] as String?,
+        bufferedAhead:
+            Duration(microseconds: map['bufferedAhead'] as int? ?? 0),
+        hasBuffered: map['hasBuffered'] as bool? ?? true,
         bufferedPositionPerIndex:
             (map['bufferedPositionPerIndex'] as List<dynamic>?)
                     ?.map((e) => Duration(microseconds: (e as num).toInt()))

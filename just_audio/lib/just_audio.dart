@@ -137,6 +137,8 @@ class AudioPlayer {
   final _durationSubject = BehaviorSubject<Duration?>.seeded(null);
   final _bufferedPositionSubject =
       BehaviorSubject<Duration>.seeded(Duration.zero);
+  final _bufferStateSubject =
+      BehaviorSubject<BufferState>.seeded(const BufferState());
   final _bufferedPositionPerIndexSubject =
       BehaviorSubject<List<Duration>>.seeded(const []);
   final _loadedDurationPerIndexSubject =
@@ -288,6 +290,8 @@ class AudioPlayer {
         playbackEventStream.map((event) => event.processingState).distinct());
     _bufferedPositionSubject.addStream(
         playbackEventStream.map((event) => event.bufferedPosition).distinct());
+    _bufferStateSubject.addStream(
+        playbackEventStream.map((event) => event.bufferState).distinct());
     _bufferedPositionPerIndexSubject.addStream(playbackEventStream
         .map((event) => event.bufferedPositionPerIndex)
         .distinct());
@@ -539,6 +543,14 @@ class AudioPlayer {
   /// A stream of buffered positions.
   Stream<Duration> get bufferedPositionStream =>
       _bufferedPositionSubject.stream.distinct();
+
+  /// The buffer of the current item as of the last playback event.
+  BufferState get bufferState =>
+      _bufferStateSubject.nvalue ?? const BufferState();
+
+  /// A stream of [bufferState] values.
+  Stream<BufferState> get bufferStateStream =>
+      _bufferStateSubject.stream.distinct();
 
   /// The buffered end-position for each indexed audio source in the current
   /// playlist. Index `i` reflects how far source `i` has been buffered.
@@ -1520,6 +1532,7 @@ class AudioPlayer {
       await _durationSubject.close();
       await _processingStateSubject.close();
       await _bufferedPositionSubject.close();
+      await _bufferStateSubject.close();
       await _bufferedPositionPerIndexSubject.close();
       await _loadedDurationPerIndexSubject.close();
       await _errorsPerItemSubject.close();
@@ -1657,6 +1670,8 @@ class AudioPlayer {
           androidAudioSessionId: message.androidAudioSessionId,
           errorCode: message.errorCode,
           errorMessage: message.errorMessage,
+          bufferedAhead: message.bufferedAhead,
+          hasBuffered: message.hasBuffered,
           bufferedPositionPerIndex: message.bufferedPositionPerIndex,
           loadedDurationPerIndex: message.loadedDurationPerIndex,
           errorsPerItem: message.errorsPerItem
@@ -2083,6 +2098,18 @@ class PlaybackEvent {
   /// The buffer position.
   final Duration bufferedPosition;
 
+  /// How much audio of the current item is loaded from the playhead forward.
+  final Duration bufferedAhead;
+
+  /// Whether the current item has received any data yet.
+  final bool hasBuffered;
+
+  BufferState get bufferState => BufferState(
+        position: bufferedPosition,
+        ahead: bufferedAhead,
+        hasBuffered: hasBuffered,
+      );
+
   /// The media duration, or `null` if unknown.
   final Duration? duration;
 
@@ -2134,6 +2161,8 @@ class PlaybackEvent {
     this.androidAudioSessionId,
     this.errorCode,
     this.errorMessage,
+    this.bufferedAhead = Duration.zero,
+    this.hasBuffered = true,
     this.bufferedPositionPerIndex = const [],
     this.loadedDurationPerIndex = const [],
     this.errorsPerItem = const [],
@@ -2151,6 +2180,8 @@ class PlaybackEvent {
     int? androidAudioSessionId,
     int? errorCode,
     String? errorMessage,
+    Duration? bufferedAhead,
+    bool? hasBuffered,
     List<Duration>? bufferedPositionPerIndex,
     List<Duration?>? loadedDurationPerIndex,
     List<PlayerItemError?>? errorsPerItem,
@@ -2167,6 +2198,8 @@ class PlaybackEvent {
             androidAudioSessionId ?? this.androidAudioSessionId,
         errorCode: errorCode ?? this.errorCode,
         errorMessage: errorMessage ?? this.errorMessage,
+        bufferedAhead: bufferedAhead ?? this.bufferedAhead,
+        hasBuffered: hasBuffered ?? this.hasBuffered,
         bufferedPositionPerIndex:
             bufferedPositionPerIndex ?? this.bufferedPositionPerIndex,
         loadedDurationPerIndex:
@@ -2186,6 +2219,8 @@ class PlaybackEvent {
         androidAudioSessionId,
         errorCode,
         errorMessage,
+        bufferedAhead,
+        hasBuffered,
         ...bufferedPositionPerIndex,
         ...loadedDurationPerIndex,
         ...errorsPerItem,
@@ -2205,6 +2240,8 @@ class PlaybackEvent {
       androidAudioSessionId == other.androidAudioSessionId &&
       errorCode == other.errorCode &&
       errorMessage == other.errorMessage &&
+      bufferedAhead == other.bufferedAhead &&
+      hasBuffered == other.hasBuffered &&
       _listEquals(bufferedPositionPerIndex, other.bufferedPositionPerIndex) &&
       _listEquals(loadedDurationPerIndex, other.loadedDurationPerIndex) &&
       _listEquals(errorsPerItem, other.errorsPerItem);
@@ -2212,6 +2249,38 @@ class PlaybackEvent {
   @override
   String toString() =>
       "{processingState=$processingState, updateTime=$updateTime, updatePosition=$updatePosition, bufferedPosition=$bufferedPosition, duration=$duration, currentIndex=$currentIndex}";
+}
+
+/// The buffer of the current item.
+class BufferState {
+  /// The position up to which audio is buffered.
+  final Duration position;
+
+  /// How much audio is buffered from the playhead forward.
+  final Duration ahead;
+
+  /// False until the item's first request has delivered data.
+  final bool hasBuffered;
+
+  const BufferState({
+    this.position = Duration.zero,
+    this.ahead = Duration.zero,
+    this.hasBuffered = true,
+  });
+
+  @override
+  int get hashCode => Object.hash(position, ahead, hasBuffered);
+
+  @override
+  bool operator ==(Object other) =>
+      other is BufferState &&
+      position == other.position &&
+      ahead == other.ahead &&
+      hasBuffered == other.hasBuffered;
+
+  @override
+  String toString() =>
+      "{position=$position, ahead=$ahead, hasBuffered=$hasBuffered}";
 }
 
 bool _listEquals<T>(List<T> a, List<T> b) {

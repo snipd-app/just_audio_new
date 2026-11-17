@@ -967,6 +967,8 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
         event.put("updatePosition", 1000 * updatePosition);
         event.put("updateTime", updateTime);
         event.put("bufferedPosition", 1000 * Math.max(updatePosition, bufferedPosition));
+        event.put("bufferedAhead", 1000 * (player != null ? Math.max(0L, bufferedPosition - player.getCurrentPosition()) : 0L));
+        event.put("hasBuffered", duration != null || bufferedPosition > 0);
         event.put("icyMetadata", collectIcyMetadata());
         event.put("duration", duration);
         event.put("currentIndex", currentIndex);
